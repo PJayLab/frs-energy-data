@@ -7,3 +7,4 @@ websockets
 aiosqlite
 pymodbus
 geoalchemy2
+shapely
