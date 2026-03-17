@@ -8,6 +8,7 @@ from sqlalchemy import select
 from database import get_db, engine, Base
 from models import Object, Feeder
 from api.import_router import router as import_router
+from api.search_router import router as search_router
 
 
 # ----------------------
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
 # ----------------------
 app = FastAPI(lifespan=lifespan)
 app.include_router(import_router)
+app.include_router(search_router)
 
 
 # ----------------------
