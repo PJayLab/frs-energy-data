@@ -9,6 +9,12 @@ def setup_logging(level=logging.INFO):
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+def normalize_obj_name(name: str) -> str:
+    """Entfernt führende/abschließende Leerzeichen und alle Spaces."""
+    if not name:
+        return ""
+    return name.replace(" ", "").strip()
+
 # --- Name Normalisierung ---
 def normalize_name(name: str) -> str:
     """Alles klein, Sonderzeichen entfernen, Leerzeichen entfernen."""

@@ -28,6 +28,16 @@ class FeederCreate(BaseModel):
     notes: Optional[str]
 
 
+class GPSPoint(BaseModel):
+    name: str
+    lat: float
+    lon: float
+    ckw_id: Optional[str] = None
+    type: Optional[str] = None  # z. B. "distribution_box", "transformer"
+
+class GPSImportData(BaseModel):
+    points: List[GPSPoint]
+
 class ImportData(BaseModel):
     raw_entries: List[dict]
     objects: List[ObjectCreate] = []

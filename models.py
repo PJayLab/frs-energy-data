@@ -22,6 +22,7 @@ class Object(Base):
     name = Column(String, nullable=False)
     type = Column(Enum(ObjectType, name="object_type"), nullable=False)
     description = Column(Text)
+    ckw_id = Column(Text)
 
     # PostGIS geometry (Point)
     geom = Column(Geometry(geometry_type="POINT", srid=4326))
