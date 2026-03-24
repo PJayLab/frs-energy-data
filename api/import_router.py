@@ -1,24 +1,19 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
+from ..schemas import ImportData
+from ..services import import_to_db
+from ..database import get_db
 
-from database import get_db
-from schemas import ImportData
-from crud import create_object, create_feeder
+router = APIRouter(prefix="/import", tags=["Import"])
 
-router = APIRouter()
+@router.post("/json")
+async def import_json(payload: list[dict], db: AsyncSession = Depends(get_db)):
+    """
+    Importiere JSON Payload direkt in die DB.
+    """
+    if not payload:
+        raise HTTPException(status_code=400, detail="Empty payload")
 
-
-@router.post("/import-test-data")
-async def import_test_data(data: ImportData, db: AsyncSession = Depends(get_db)):
-
-    # Objekte zuerst erstellen
-    for obj in data.objects:
-        await create_object(db, obj)
-
-    # dann feeders
-    for feeder in data.feeders:
-        await create_feeder(db, feeder)
-
-    await db.commit()
-
-    return {"status": "ok"}
+    import_data = ImportData(raw_entries=payload)
+    await import_to_db(import_data)
+    return {"status": "success", "objects": len(import_data.objects), "feeders": len(import_data.feeders)}
