@@ -5,10 +5,10 @@ from fastapi import FastAPI, Depends, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from database import get_db, engine, Base
-from models import Object, Feeder
-from api.import_router import router as import_router
-from api.search_router import router as search_router
+from frs_energy_data.database import get_db, engine, Base
+from frs_energy_data.models import Object, Feeder
+from frs_energy_data.api.import_router import router as import_router
+from frs_energy_data.api.search_router import router as search_router
 
 
 # ----------------------

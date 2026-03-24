@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..schemas import ImportData
-from ..services import import_to_db
-from ..database import get_db
+from frs_energy_data.schemas import ImportData
+from frs_energy_data.services import import_to_db
+from frs_energy_data.database import get_db
 
 router = APIRouter(prefix="/import", tags=["Import"])
 

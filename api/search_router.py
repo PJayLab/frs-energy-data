@@ -3,8 +3,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Object, Feeder
-from database import get_db
+from frs_energy_data.models import Object, Feeder
+from frs_energy_data.database import get_db
 
 router = APIRouter(prefix="/search", tags=["Search"])
 

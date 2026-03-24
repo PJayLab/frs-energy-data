@@ -3,7 +3,7 @@ from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 import enum
 
-from database import Base
+from frs_energy_data.database import Base
 
 
 # ENUM
