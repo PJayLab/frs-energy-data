@@ -8,3 +8,5 @@ aiosqlite
 pymodbus
 geoalchemy2
 shapely
+openpyxl
+python-multipart

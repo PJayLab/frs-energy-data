@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
+import json
 
 from frs_energy_data.models import Object, Feeder
 from frs_energy_data.database import get_db
@@ -9,7 +10,7 @@ from frs_energy_data.database import get_db
 router = APIRouter(prefix="/search", tags=["Search"])
 
 
-@router.get("/search2")
+@router.get("/advanced")
 async def search(
     q: str,
     type: str = Query(default="building"),
@@ -89,9 +90,9 @@ async def search(
                 "building": geo(b, b_lon, b_lat),
 
                 "feeder": {
-                    "label": feeder.feeder_label,
+                    "label": json.loads(feeder.feeder_label) if feeder.feeder_label else [],
                     "fuse_rating": feeder.fuse_rating,
-                    "notes": feeder.notes
+                    "notes": json.loads(feeder.notes) if feeder.notes and feeder.notes.strip() else []
                 },
 
                 "transformer": geo(t, t_lon, t_lat),
@@ -131,7 +132,7 @@ async def search(
     # ----------------------
 # SEARCH API (NEU)
 # ----------------------
-@router.get("/search")
+@router.get("/")
 async def search(q: str, db: AsyncSession = Depends(get_db)):
 
     result = await db.execute(
