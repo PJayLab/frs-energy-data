@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Text
+from sqlalchemy import Column, String, Enum, ForeignKey, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 import enum
@@ -8,18 +9,18 @@ import secrets
 from frs_energy_data.database import Base
 
 
-# ENUM
 class ObjectType(str, enum.Enum):
     building = "building"
     transformer = "transformer"
     distribution_box = "distribution_box"
     disconnect_point = "disconnect_point"
 
+
 def gen_short_id(length: int = 12) -> str:
     raw = secrets.token_bytes(9)
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")[:length]
 
-# OBJECTS TABLE
+
 class Object(Base):
     __tablename__ = "objects"
 
@@ -30,30 +31,30 @@ class Object(Base):
     type = Column(Enum(ObjectType, name="object_type"), nullable=False)
     description = Column(Text)
     ckw_id = Column(Text)
-
-    # PostGIS geometry (Point)
     geom = Column(Geometry(geometry_type="POINT", srid=4326))
 
 
-# FEEDERS TABLE (Abgangsliste)
-class Feeder(Base):
-    __tablename__ = "feeders"
+class ServiceConnection(Base):
+    """Only relation/connection data between referenced electrical objects."""
+
+    __tablename__ = "service_connections"
 
     id = Column(String(12), primary_key=True, default=gen_short_id)
 
     building_id = Column(String(12), ForeignKey("objects.id"), nullable=False)
     transformer_id = Column(String(12), ForeignKey("objects.id"), nullable=False)
-
     distribution_box_id = Column(String(12), ForeignKey("objects.id"), nullable=True)
     disconnect_point_id = Column(String(12), ForeignKey("objects.id"), nullable=True)
 
-    feeder_label = Column(String)  # "1", "1.1"
-    fuse_rating = Column(Integer)  # Ampere
+    disconnect_point_outgoing = Column(JSONB, nullable=True)
+    source_outgoing = Column(JSONB, nullable=True)
+    connection_notes = Column(JSONB, nullable=True)
 
-    notes = Column(Text)
 
-    # Optional relationships (nice for ORM usage)
     building = relationship("Object", foreign_keys=[building_id])
     transformer = relationship("Object", foreign_keys=[transformer_id])
     distribution_box = relationship("Object", foreign_keys=[distribution_box_id])
     disconnect_point = relationship("Object", foreign_keys=[disconnect_point_id])
+
+
+Feeder = ServiceConnection
