@@ -11,6 +11,7 @@ class ObjectType(str, Enum):
 
 
 class ObjectCreate(BaseModel):
+    location: str
     name: str
     type: ObjectType
     description: Optional[str] = None

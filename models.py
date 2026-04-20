@@ -2,6 +2,8 @@ from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
 import enum
+import base64
+import secrets
 
 from frs_energy_data.database import Base
 
@@ -13,13 +15,18 @@ class ObjectType(str, enum.Enum):
     distribution_box = "distribution_box"
     disconnect_point = "disconnect_point"
 
+def gen_short_id(length: int = 12) -> str:
+    raw = secrets.token_bytes(9)
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")[:length]
 
 # OBJECTS TABLE
 class Object(Base):
     __tablename__ = "objects"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(String(12), primary_key=True, default=gen_short_id)
+    location = Column(String, nullable=True)
     name = Column(String, nullable=False)
+    friendly_name = Column(String, nullable=True)
     type = Column(Enum(ObjectType, name="object_type"), nullable=False)
     description = Column(Text)
     ckw_id = Column(Text)
@@ -32,13 +39,13 @@ class Object(Base):
 class Feeder(Base):
     __tablename__ = "feeders"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(String(12), primary_key=True, default=gen_short_id)
 
-    building_id = Column(Integer, ForeignKey("objects.id"), nullable=False)
-    transformer_id = Column(Integer, ForeignKey("objects.id"), nullable=False)
+    building_id = Column(String(12), ForeignKey("objects.id"), nullable=False)
+    transformer_id = Column(String(12), ForeignKey("objects.id"), nullable=False)
 
-    distribution_box_id = Column(Integer, ForeignKey("objects.id"), nullable=True)
-    disconnect_point_id = Column(Integer, ForeignKey("objects.id"), nullable=True)
+    distribution_box_id = Column(String(12), ForeignKey("objects.id"), nullable=True)
+    disconnect_point_id = Column(String(12), ForeignKey("objects.id"), nullable=True)
 
     feeder_label = Column(String)  # "1", "1.1"
     fuse_rating = Column(Integer)  # Ampere

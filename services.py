@@ -114,7 +114,7 @@ async def import_feeders_objects(raw_entries: list[dict], session: AsyncSession)
         result = await session.execute(select(Object).where(Object.name == normalized_obj_name))
         db_obj = result.scalar_one_or_none()
         if not db_obj:
-            db_obj = Object(name=normalized_obj_name, type="building")
+            db_obj = Object(name=normalized_obj_name, friendly_name=obj_name, type="building", location=entry["gemeinde"].strip())
             session.add(db_obj)
             await session.flush()  # ID sofort verfügbar
 
@@ -190,6 +190,7 @@ async def import_gps_objects(import_data: GPSImportData, session: AsyncSession):
             # Neues Objekt
             db_obj = Object(
                 name=point.name,
+                friendly_name=None,
                 type=obj_type_enum,
                 ckw_id=point.ckw_id,
                 geom=geom_point
