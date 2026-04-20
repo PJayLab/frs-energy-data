@@ -35,7 +35,7 @@ class Object(Base):
 
 
 class ServiceConnection(Base):
-    """Electricity connection from transformer-side network to a building."""
+    """Only relation/connection data between referenced electrical objects."""
 
     __tablename__ = "service_connections"
 
@@ -46,16 +46,9 @@ class ServiceConnection(Base):
     distribution_box_id = Column(String(12), ForeignKey("objects.id"), nullable=True)
     disconnect_point_id = Column(String(12), ForeignKey("objects.id"), nullable=True)
 
-    municipality = Column(String, nullable=True)  # Gemeinde
-    object_name = Column(String, nullable=True)  # Objekt
-    insurance_number = Column(String, nullable=True)  # Assek. Nr.
-    unswitched_terminal = Column(String, nullable=True)  # TK ohne Schaltmöglichkeit
-    first_disconnect_point_name = Column(String, nullable=True)  # Erste Trennstelle
-    source_name = Column(String, nullable=True)  # Speisung
-
-    disconnect_point_outgoing = Column(JSONB, nullable=True)  # Abgang Trennstelle
-    source_outgoing = Column(JSONB, nullable=True)  # Abgang Speisung
-    connection_notes = Column(JSONB, nullable=True)  # Bemerkungen/Verbindung
+    disconnect_point_outgoing = Column(JSONB, nullable=True)
+    source_outgoing = Column(JSONB, nullable=True)
+    connection_notes = Column(JSONB, nullable=True)
 
     fuse_rating = Column(Integer)
 
@@ -65,5 +58,4 @@ class ServiceConnection(Base):
     disconnect_point = relationship("Object", foreign_keys=[disconnect_point_id])
 
 
-# Backwards-compatible alias in case older modules still import Feeder.
 Feeder = ServiceConnection

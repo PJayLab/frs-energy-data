@@ -20,14 +20,8 @@ class ObjectCreate(BaseModel):
 
 
 class ServiceConnectionCreate(BaseModel):
-    municipality: Optional[str] = None
-    object_name: Optional[str] = None
-    insurance_number: Optional[str] = None
     connection_notes: List[str] = Field(default_factory=list)
-    unswitched_terminal: Optional[str] = None
-    first_disconnect_point: Optional[str] = None
     disconnect_point_outgoing: List[str] = Field(default_factory=list)
-    source_name: Optional[str] = None
     source_outgoing: List[str] = Field(default_factory=list)
 
     building_name: str
@@ -93,14 +87,8 @@ class ImportData(BaseModel):
 
             connections_list.append(
                 ServiceConnectionCreate(
-                    municipality=entry.get("municipality") or entry.get("gemeinde"),
-                    object_name=entry.get("object") or entry.get("objekt") or building_name,
-                    insurance_number=entry.get("insurance_number") or entry.get("assek_nr"),
                     connection_notes=notes,
-                    unswitched_terminal=unswitched_terminal,
-                    first_disconnect_point=first_disconnect,
                     disconnect_point_outgoing=disconnect_outgoing,
-                    source_name=source_name,
                     source_outgoing=source_outgoing,
                     building_name=building_name,
                     transformer_name=source_name or "",
