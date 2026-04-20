@@ -31,7 +31,8 @@ def extract_type_code(text: str, types=["TST", "KAK", "TEF"]):
     Extrahiert Typ + Nummer zusammen, z.B. 'KAK29467'.
     Gibt (base_name, code) zurück.
     """
-    pattern = re.compile(rf"^(.*?)(?:({'|'.join(t + r'\d+' for t in types)}))$")
+    joined = '|'.join(f"{t}\\d+" for t in types)
+    pattern = re.compile(rf"^(.*?)(?:({joined}))$")
     match = pattern.match(text)
     if match:
         return match.groups()

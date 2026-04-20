@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from frs_energy_data.database import get_db, engine, Base
-from frs_energy_data.models import Object, Feeder
+from frs_energy_data.models import Object, ServiceConnection
 from frs_energy_data.api.import_router import router as import_router
 from frs_energy_data.api.search_router import router as search_router
 

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
 from enum import Enum
 
@@ -11,22 +11,31 @@ class ObjectType(str, Enum):
 
 
 class ObjectCreate(BaseModel):
-    location: str
+    location: Optional[str] = None
     name: str
     type: ObjectType
     description: Optional[str] = None
-    lat: float
-    lon: float
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 
-class FeederCreate(BaseModel):
+class ServiceConnectionCreate(BaseModel):
+    municipality: Optional[str] = None
+    object_name: Optional[str] = None
+    insurance_number: Optional[str] = None
+    connection_notes: List[str] = Field(default_factory=list)
+    unswitched_terminal: Optional[str] = None
+    first_disconnect_point: Optional[str] = None
+    disconnect_point_outgoing: List[str] = Field(default_factory=list)
+    source_name: Optional[str] = None
+    source_outgoing: List[str] = Field(default_factory=list)
+
     building_name: str
     transformer_name: str
     distribution_box_name: Optional[str] = None
     disconnect_point_name: Optional[str] = None
-    feeder_label: Optional[str]
-    fuse_rating: Optional[int]
-    notes: Optional[str]
+
+    fuse_rating: Optional[int] = None
 
 
 class GPSPoint(BaseModel):
@@ -34,54 +43,72 @@ class GPSPoint(BaseModel):
     lat: float
     lon: float
     ckw_id: Optional[str] = None
-    type: Optional[str] = None  # z. B. "distribution_box", "transformer"
+    type: Optional[str] = None
+
 
 class GPSImportData(BaseModel):
     points: List[GPSPoint]
 
+
 class ImportData(BaseModel):
     raw_entries: List[dict]
     objects: List[ObjectCreate] = []
-    feeders: List[FeederCreate] = []
+    service_connections: List[ServiceConnectionCreate] = []
 
     @model_validator(mode="after")
-    def build_objects_and_feeders(cls, instance):
+    def build_objects_and_service_connections(cls, instance):
         objects_map = {}
-        feeders_list = []
+        connections_list = []
 
         for entry in instance.raw_entries:
-            building_name = entry["objekt"].strip()
+            building_name = str(entry.get("object") or entry.get("objekt") or "").strip()
+            if not building_name:
+                continue
+
             if building_name not in objects_map:
                 objects_map[building_name] = ObjectCreate(name=building_name, type=ObjectType.building)
 
-            dp_name = entry.get("tk_ohne_schalt")
-            if dp_name:
-                dp_name = dp_name.strip()
-                if dp_name and dp_name not in objects_map:
-                    objects_map[dp_name] = ObjectCreate(name=dp_name, type=ObjectType.disconnect_point)
+            unswitched_terminal = str(entry.get("unswitched_terminal") or entry.get("tk_ohne_schalt") or "").strip() or None
+            if unswitched_terminal and unswitched_terminal not in objects_map:
+                objects_map[unswitched_terminal] = ObjectCreate(name=unswitched_terminal, type=ObjectType.disconnect_point)
 
-            db_name = entry.get("erste_trennstelle")
-            if db_name:
-                db_name = db_name.strip()
-                if db_name and db_name not in objects_map:
-                    objects_map[db_name] = ObjectCreate(name=db_name, type=ObjectType.distribution_box)
+            first_disconnect = str(entry.get("first_disconnect_point") or entry.get("erste_trennstelle") or "").strip() or None
+            if first_disconnect and first_disconnect not in objects_map:
+                objects_map[first_disconnect] = ObjectCreate(name=first_disconnect, type=ObjectType.distribution_box)
 
-            tr_name = entry.get("speisung")
-            if tr_name:
-                tr_name = tr_name.strip()
-                if tr_name and tr_name not in objects_map:
-                    objects_map[tr_name] = ObjectCreate(name=tr_name, type=ObjectType.transformer)
+            source_name = str(entry.get("source_name") or entry.get("speisung") or "").strip() or None
+            if source_name and source_name not in objects_map:
+                objects_map[source_name] = ObjectCreate(name=source_name, type=ObjectType.transformer)
 
-            feeders_list.append(
-                FeederCreate(
+            notes = entry.get("connection_notes") or entry.get("bemerkungen") or []
+            source_outgoing = entry.get("source_outgoing") or entry.get("abgang_speisung") or []
+            disconnect_outgoing = entry.get("disconnect_point_outgoing") or entry.get("abgang_trennstelle") or []
+
+            if isinstance(notes, str):
+                notes = [notes]
+            if isinstance(source_outgoing, str):
+                source_outgoing = [source_outgoing]
+            if isinstance(disconnect_outgoing, str):
+                disconnect_outgoing = [disconnect_outgoing]
+
+            connections_list.append(
+                ServiceConnectionCreate(
+                    municipality=entry.get("municipality") or entry.get("gemeinde"),
+                    object_name=entry.get("object") or entry.get("objekt") or building_name,
+                    insurance_number=entry.get("insurance_number") or entry.get("assek_nr"),
+                    connection_notes=notes,
+                    unswitched_terminal=unswitched_terminal,
+                    first_disconnect_point=first_disconnect,
+                    disconnect_point_outgoing=disconnect_outgoing,
+                    source_name=source_name,
+                    source_outgoing=source_outgoing,
                     building_name=building_name,
-                    transformer_name=tr_name if tr_name else "",
-                    distribution_box_name=db_name if db_name else None,
-                    disconnect_point_name=dp_name if dp_name else None,
-                    notes="; ".join(entry.get("bemerkungen", [])) if entry.get("bemerkungen") else None
+                    transformer_name=source_name or "",
+                    distribution_box_name=first_disconnect,
+                    disconnect_point_name=unswitched_terminal,
                 )
             )
 
         instance.objects = list(objects_map.values())
-        instance.feeders = feeders_list
+        instance.service_connections = connections_list
         return instance
