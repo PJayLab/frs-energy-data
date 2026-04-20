@@ -46,7 +46,6 @@ async def create_service_connection(db, connection):
         disconnect_point_outgoing=connection.disconnect_point_outgoing,
         source_outgoing=connection.source_outgoing,
         connection_notes=connection.connection_notes,
-        fuse_rating=connection.fuse_rating,
     )
 
     db.add(db_connection)

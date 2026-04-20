@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Text
+from sqlalchemy import Column, String, Enum, ForeignKey, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
@@ -50,7 +50,6 @@ class ServiceConnection(Base):
     source_outgoing = Column(JSONB, nullable=True)
     connection_notes = Column(JSONB, nullable=True)
 
-    fuse_rating = Column(Integer)
 
     building = relationship("Object", foreign_keys=[building_id])
     transformer = relationship("Object", foreign_keys=[transformer_id])

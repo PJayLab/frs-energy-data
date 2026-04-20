@@ -25,7 +25,6 @@ Stores only connection-related information between referenced objects:
 - `disconnect_point_outgoing` (JSONB)
 - `source_outgoing` (JSONB)
 - `connection_notes` (JSONB)
-- `fuse_rating` (optional integer)
 
 ## API overview
 
@@ -39,7 +38,10 @@ Stores only connection-related information between referenced objects:
 ### Search
 
 - `GET /search/?q=<query>&fields=address&fields=location&fields=uuid`
+- `GET /search/address?q=<query>&fields=address&fields=location&fields=uuid`
 - `GET /search/address/{uuid}`
+- `GET /search/connection?q=<query>&fields=address&fields=location&fields=connection_uuid`
+- `GET /search/connection/{uuid}`
 - `GET /search/nearby?lat=<latitude>&lon=<longitude>&radius=500`
 
 ## Local run

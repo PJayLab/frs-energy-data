@@ -29,7 +29,6 @@ class ServiceConnectionCreate(BaseModel):
     distribution_box_name: Optional[str] = None
     disconnect_point_name: Optional[str] = None
 
-    fuse_rating: Optional[int] = None
 
 
 class GPSPoint(BaseModel):
