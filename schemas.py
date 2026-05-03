@@ -101,6 +101,11 @@ class ImportData(BaseModel):
         return instance
 
 
+class ConnectionIssueReportCreate(BaseModel):
+    user: str
+    remarks: str
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
