@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from frs_energy_data.database import get_db
-from frs_energy_data.models import Object, ServiceConnection
+from frs_energy_data.models import Object, ObjectType, ServiceConnection
 from frs_energy_data.utils import normalize_name
 
 router = APIRouter(prefix="/search", tags=["Search"])
@@ -186,6 +186,7 @@ async def search_connections(
             Building.geom.ST_Y().label("b_lat"),
         )
         .join(Building, ServiceConnection.building_id == Building.id)
+        .where(Building.type == ObjectType.building)
         .where(or_(*filters))
         .limit(limit * 4)
     )
