@@ -10,3 +10,4 @@ geoalchemy2
 shapely
 openpyxl
 python-multipart
+PyJWT

@@ -9,6 +9,8 @@ from frs_energy_data.database import get_db, engine, Base
 from frs_energy_data.models import Object, ServiceConnection
 from frs_energy_data.api.import_router import router as import_router
 from frs_energy_data.api.search_router import router as search_router
+from frs_energy_data.api.auth_router import router as auth_router
+from frs_energy_data.auth import get_current_user
 
 
 # ----------------------
@@ -34,8 +36,9 @@ async def lifespan(app: FastAPI):
 # App
 # ----------------------
 app = FastAPI(lifespan=lifespan)
-app.include_router(import_router)
-app.include_router(search_router)
+app.include_router(auth_router)
+app.include_router(import_router, dependencies=[Depends(get_current_user)])
+app.include_router(search_router, dependencies=[Depends(get_current_user)])
 
 # ----------------------
 # WebSocket

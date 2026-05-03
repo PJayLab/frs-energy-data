@@ -99,3 +99,18 @@ class ImportData(BaseModel):
         instance.objects = list(objects_map.values())
         instance.service_connections = connections_list
         return instance
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"

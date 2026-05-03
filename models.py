@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Enum, ForeignKey, Text
+from sqlalchemy import Column, String, Enum, ForeignKey, Text, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
@@ -58,3 +58,12 @@ class ServiceConnection(Base):
 
 
 Feeder = ServiceConnection
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String(12), primary_key=True, default=gen_short_id)
+    username = Column(String(128), unique=True, nullable=False, index=True)
+    password_hash = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
