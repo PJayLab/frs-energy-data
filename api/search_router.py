@@ -146,7 +146,7 @@ async def get_address_by_uuid(uuid: str, db: AsyncSession = Depends(get_db)):
 @router.get("/connection")
 async def search_connections(
     q: str,
-    fields: list[str] = Query(default=["address", "location", "uuid"]),
+    fields: list[str] = Query(default=["address", "location", "connection_uuid"]),
     limit: int = Query(default=25, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
@@ -193,7 +193,7 @@ async def search_connections(
     ranked = sorted(rows, key=lambda row: _rank_score(q, row[1]), reverse=True)[:limit]
 
     allowed_fields = {"address", "location", "uuid", "lat", "lon", "type", "connection_uuid"}
-    chosen = [f for f in fields if f in allowed_fields] or ["address", "location", "uuid"]
+    chosen = [f for f in fields if f in allowed_fields] or ["address", "location", "connection_uuid"]
 
     output = []
     for connection, building, b_lon, b_lat in ranked:
