@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Enum, ForeignKey, Text, Boolean
+from sqlalchemy import Column, String, Enum, ForeignKey, Text, Boolean, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
@@ -58,6 +58,19 @@ class ServiceConnection(Base):
 
 
 Feeder = ServiceConnection
+
+class ConnectionIssueReport(Base):
+    __tablename__ = "connection_issue_reports"
+
+    id = Column(String(12), primary_key=True, default=gen_short_id)
+    connection_id = Column(String(12), ForeignKey("service_connections.id"), nullable=False, index=True)
+    user = Column(String(255), nullable=False)
+    remarks = Column(Text, nullable=False)
+    is_solved = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    connection = relationship("ServiceConnection")
 
 
 class User(Base):
