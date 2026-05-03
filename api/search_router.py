@@ -8,6 +8,7 @@ from sqlalchemy.orm import aliased
 from frs_energy_data.database import get_db
 from frs_energy_data.models import Object, ObjectType, ServiceConnection
 from frs_energy_data.utils import normalize_name
+from frs_energy_data.schemas import ConnectionIssueReportCreate
 
 router = APIRouter(prefix="/search", tags=["Search"])
 
@@ -285,6 +286,36 @@ async def get_connection_by_uuid(uuid: str, db: AsyncSession = Depends(get_db)):
         "transformer": obj_payload(transformer, t_lon, t_lat),
         "distribution_box": obj_payload(distribution_box, d_lon, d_lat),
         "disconnect_point": obj_payload(disconnect_point, dp_lon, dp_lat),
+    }
+
+
+@router.post("/connection/{uuid}/report")
+async def report_wrong_connection(
+    uuid: str,
+    payload: ConnectionIssueReportCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    connection = await db.get(ServiceConnection, uuid)
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    report = ConnectionIssueReport(
+        connection_id=uuid,
+        user=payload.user,
+        remarks=payload.remarks,
+    )
+    db.add(report)
+    await db.commit()
+    await db.refresh(report)
+
+    return {
+        "id": report.id,
+        "connection_uuid": report.connection_id,
+        "user": report.user,
+        "remarks": report.remarks,
+        "is_solved": report.is_solved,
+        "created_at": report.created_at,
+        "updated_at": report.updated_at,
     }
 
 
