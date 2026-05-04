@@ -4,9 +4,9 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from openpyxl import load_workbook
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from frs_energy_data.database import get_db
-from frs_energy_data.schemas import ImportData, GPSImportData
-from frs_energy_data.services import (
+from app.database import get_db
+from app.schemas import ImportData, GPSImportData
+from app.services import (
     import_to_db,
     import_gps_objects,
     import_service_connections,

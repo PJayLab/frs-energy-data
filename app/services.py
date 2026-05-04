@@ -2,9 +2,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from geoalchemy2 import WKTElement
 
-from frs_energy_data.database import AsyncSessionLocal, engine
-from frs_energy_data.models import Object, ServiceConnection, ObjectType
-from frs_energy_data.schemas import ImportData, GPSImportData
+from app.database import AsyncSessionLocal, engine
+from app.models import Object, ServiceConnection, ObjectType
+from app.schemas import ImportData, GPSImportData
 
 
 async def create_tables():

@@ -10,8 +10,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from frs_energy_data.database import get_db
-from frs_energy_data.models import User
+from app.database import get_db
+from app.models import User
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
 JWT_ALG = "HS256"

@@ -2,10 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from frs_energy_data.auth import create_access_token, hash_password, verify_password
-from frs_energy_data.database import get_db
-from frs_energy_data.models import User
-from frs_energy_data.schemas import LoginRequest, TokenResponse, UserCreateRequest
+from app.auth import create_access_token, hash_password, verify_password
+from app.database import get_db
+from app.models import User
+from app.schemas import LoginRequest, TokenResponse, UserCreateRequest
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 

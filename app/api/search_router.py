@@ -5,10 +5,10 @@ from sqlalchemy import func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from frs_energy_data.database import get_db
-from frs_energy_data.models import Object, ObjectType, ServiceConnection, ConnectionIssueReport
-from frs_energy_data.utils import normalize_name
-from frs_energy_data.schemas import ConnectionIssueReportCreate
+from app.database import get_db
+from app.models import Object, ObjectType, ServiceConnection, ConnectionIssueReport
+from app.utils import normalize_name
+from app.schemas import ConnectionIssueReportCreate
 
 router = APIRouter(prefix="/search", tags=["Search"])
 

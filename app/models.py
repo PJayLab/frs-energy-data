@@ -6,7 +6,7 @@ import enum
 import base64
 import secrets
 
-from frs_energy_data.database import Base
+from app.database import Base
 
 
 class ObjectType(str, enum.Enum):
