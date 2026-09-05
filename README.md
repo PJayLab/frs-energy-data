@@ -62,5 +62,8 @@ uvicorn main:app --reload
 
 ## Notes
 
+- Import matching, update rules, limitations and regression tests are documented in
+  [docs/import-behavior.md](docs/import-behavior.md).
+
 - This repository currently contains schema-level refactors without database migration scripts.
 - If you already have deployed tables, add a migration before rolling out.

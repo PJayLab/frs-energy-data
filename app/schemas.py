@@ -33,6 +33,7 @@ class ServiceConnectionCreate(BaseModel):
 
 class GPSPoint(BaseModel):
     name: str
+    location: Optional[str] = None
     lat: float
     lon: float
     ckw_id: Optional[str] = None
