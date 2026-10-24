@@ -70,6 +70,29 @@ does not install updated requirements.
 uvicorn main:app --reload
 ```
 
+## Replacing stale Excel connections
+
+The default `POST /import/excel` merges data without deleting connections.
+To reconcile the complete connection set for each building in an Excel upload:
+
+1. Preview: `POST /import/excel?mode=replace_buildings&dry_run=true`.
+2. Inspect `deleted`, `removed_connections`, `skipped`, and `warnings_by_reason`.
+3. Apply the same upload: `POST /import/excel?mode=replace_buildings&dry_run=false`.
+
+Send the workbook as the multipart `file` field. Replacement requires the original
+nine-column `Modified` layout and all rows for each included building. It retains
+one ID per matching path, combines notes from repeated source rows, deletes stale
+connections, and replaces the building's insurance-number list. Blank optional
+references clear old references in this mode. New paths receive new IDs.
+
+A missing/ambiguous reference or invalid row blocks connection replacement for
+that building. Stale connections with issue reports also block replacement.
+Buildings absent from the upload, objects with unknown municipality, and grid
+objects are not deleted. This is per-building replacement, not a database reset.
+The preview rolls back all writes; its counters describe planned changes.
+`consolidated` counts input rows combined into one connection. Save the response
+if you need the old connection values listed in `removed_connections`.
+
 ## Notes
 
 - Import responses count `created`, `updated`, and `unchanged` entries in
@@ -88,7 +111,7 @@ uvicorn main:app --reload
   only adds the nullable column; reimport the Excel file to populate it.
 - Excel imports preserve multiline note blocks and collect multiple insurance
   numbers for repeated addresses. Ambiguous positions are reported and skipped.
-  Reimports add numbers without deleting previously recorded ones.
+  Merge imports add numbers without deleting previously recorded ones.
 - Address and connection details expose `insurance_numbers`. Search responses
   can include them with `fields=insurance_numbers`.
 - Run import regressions with `python -m unittest discover -s tests -v`.

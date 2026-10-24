@@ -753,6 +753,7 @@ class PostgresImportTests(ImportTests):
             await conn.execute(text(f'CREATE SCHEMA "{self.schema}"'))
             await conn.run_sync(lambda c: Object.__table__.create(c))
             await conn.run_sync(lambda c: ServiceConnection.__table__.create(c))
+            await conn.run_sync(lambda c: ConnectionIssueReport.__table__.create(c))
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.session = self.sessions()
         self.session.add(Object(name='TransformerA', friendly_name='Transformer A', type='transformer'))

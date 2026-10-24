@@ -13,6 +13,13 @@ notes and insurance numbers were removed before matching object positions.
 Missing optional references were not reported, and missing transformers silently
 discarded connections.
 
+The historical implementation in commit `9419fb5` selected buildings by name
+alone and inserted a new connection for every row. This explains how the three
+Sursee Bahnhofplatz 6 rows could be attached to the earlier Geuensee object.
+The source workbook has Geuensee in `Modified` row 21 (outgoing 4/5) and Sursee
+in row 1661 (outgoing 2/2, Stationsgebäude and Verkaufsstand). Historical execution
+logs are not available to identify the exact import that produced the stored rows.
+
 ## Object identity
 
 All three import paths use `normalize_object_name`: remove whitespace (including
@@ -23,8 +30,14 @@ name when both normalize to the same identity.
 1. A nonempty `ckw_id` matches first, even after a rename.
 2. Otherwise match normalized name and trimmed municipality/location.
 3. With a municipality, a unique historical object without location may be
-   adopted if there is no exact municipal match.
-4. Without municipality, only a unique name match is accepted.
+   adopted in merge mode if there is no exact municipal match and the batch
+   contains only one municipality for this name. Replacement never adopts
+   a locationless object by name.
+4. Connection imports require a municipality. GPS imports can still use a unique
+   name without municipality.
+
+Object upserts respect the requested type. Buildings cannot be used as grid
+references, and an asset ID cannot move a building between known municipalities.
 
 Conflicting asset IDs and multiple candidates produce warnings and skips rather
 than arbitrary matches or new duplicates. Incoming nonempty object attributes
@@ -49,7 +62,7 @@ multiple-source warning; genuinely distinct sources retain the existing warning.
 Objects are indexed in memory once per import by normalized name and asset ID;
 new and renamed objects immediately update that index.
 
-## Connection identity and Excel edits
+## Connection identity and Excel edits (default merge mode)
 
 Signatures contain building, transformer, distribution box, disconnect point and
 both outgoing arrays. Arrays are trimmed and stripped of empty/null elements,
@@ -85,6 +98,29 @@ an explicit empty string in JSON clears them. Blank Excel reference cells parse
 as None, so removing those references requires an explicit JSON edit. An explicit
 unresolved reference skips the whole connection and reports every missing field.
 Transformer is always required.
+
+## Explicit Excel replacement
+
+See the README for the preview/apply URLs. `replace_buildings` treats the upload
+as the complete connection snapshot only for each included municipality/address.
+All rows for a building must resolve successfully before its connections can be
+replaced. Existing object metadata may still be refreshed during preparation;
+blocked buildings keep their old connections and insurance numbers.
+
+Matching full path signatures retain one existing ID (prefer one carrying issue
+reports). Notes from the same incoming path are combined. Old notes are replaced
+by the current Excel notes even if duplicate records disagree. Extra IDs and paths
+absent from the source are deleted only when they carry no issue reports. If any
+required deletion is protected by a report, that building is skipped entirely.
+No reports are silently deleted or reassigned. Optional blank Excel references
+are cleared. Insurance numbers are replaced by the source set for the building.
+
+`dry_run=true` rolls back the entire transaction, including object writes and
+connection deletions. Responses use status `preview` and include planned changes.
+`deleted` and `removed_connections` describe removed records; `consolidated`
+counts repeated input paths collapsed before saving. `imported_count` counts the
+resulting desired connection operations in this mode. Unlisted buildings and all
+object rows are preserved. No new database migration is needed for this mode.
 
 ## Excel positions and remaining schema limits
 
