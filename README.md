@@ -55,6 +55,11 @@ Stores only connection-related information between referenced objects:
 pip install -r requirements.txt
 ```
 
+SQLAlchemy is installed with its `asyncio` extra to include `greenlet`, which
+the asynchronous database layer requires. After changing dependencies, rebuild
+the Docker image and recreate the container; restarting an existing container
+does not install updated requirements.
+
 2. Configure PostgreSQL/PostGIS connection in `database.py` if needed.
 
 3. Start app (example):
