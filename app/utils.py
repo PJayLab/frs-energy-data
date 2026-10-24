@@ -10,10 +10,9 @@ def setup_logging(level=logging.INFO):
     )
 
 def normalize_obj_name(name: str) -> str:
-    """Entfernt führende/abschließende Leerzeichen und alle Spaces."""
-    if not name:
-        return ""
-    return name.replace(" ", "").strip()
+    """Compatibility alias for the shared import normalization."""
+    from app.import_helpers import normalize_object_name
+    return normalize_object_name(name)
 
 # --- Name Normalisierung ---
 def normalize_name(name: str) -> str:

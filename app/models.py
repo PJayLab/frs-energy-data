@@ -31,6 +31,8 @@ class Object(Base):
     type = Column(Enum(ObjectType, name="object_type"), nullable=False)
     description = Column(Text)
     ckw_id = Column(Text)
+    # Building insurance numbers (Assek. Nr.), not CKW asset identifiers.
+    insurance_numbers = Column(JSONB, nullable=True)
     geom = Column(Geometry(geometry_type="POINT", srid=4326))
 
 

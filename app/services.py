@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from geoalchemy2 import WKTElement
@@ -5,6 +7,14 @@ from geoalchemy2 import WKTElement
 from app.database import AsyncSessionLocal, engine
 from app.models import Object, ServiceConnection, ObjectType
 from app.schemas import ImportData, GPSImportData
+from app.connection_sync import replace_building_connections
+from app.import_helpers import (
+    AmbiguousMatch, clean_text, normalize_object_name, split_positional,
+    split_compact, normalize_array_for_comparison, find_existing_object,
+    upsert_object, build_connection_signature, find_existing_service_connection,
+    upsert_service_connection, import_transaction, new_report, load_objects,
+    unique_reference_names, find_reference_object,
+)
 
 
 async def create_tables():
@@ -13,235 +23,298 @@ async def create_tables():
         await conn.run_sync(ServiceConnection.metadata.create_all)
 
 
-TECH_HINTS = ["PVA", "kVA", "Ladestation"]
+split_cell = split_compact
+split_and_clean = split_compact
 
 
-def clean_text(value):
-    if not value:
-        return None
-    return str(value).replace("\xa0", " ").strip()
-
-
-def split_cell(value):
-    if not value:
-        return []
-    lines = str(value).replace("\xa0", " ").split("\n")
-    return [line.strip() for line in lines if line.strip()]
-
-
-def split_and_clean(value):
-    if not value:
-        return []
-    lines = str(value).replace("\xa0", " ").split("\n")
-    return [line.strip() for line in lines if line.strip()]
-
-
-def is_technical(texts):
-    joined = " ".join(texts)
-    return any(hint in joined for hint in TECH_HINTS)
+def assign_notes(objects, notes):
+    """Blank object lines continue the preceding object's note block."""
+    assigned = [[] for _ in objects]
+    positions = [i for i, name in enumerate(objects) if name]
+    if len(positions) == 1:
+        assigned[positions[0]] = split_compact(notes)
+        return assigned, []
+    previous = None
+    warnings = []
+    for i, note in enumerate(notes):
+        if i < len(objects) and objects[i]:
+            previous = i
+        if not note:
+            continue
+        if i < len(objects) and previous is not None:
+            assigned[previous].append(note)
+        elif i >= len(objects) and note.startswith('Parallel Strang '):
+            for position in positions:
+                assigned[position].append(note)
+            warnings.append(dict(field='connection_notes', reason='row_wide_parallel_note', values=[note]))
+        else:
+            warnings.append(dict(field='connection_notes', reason='ambiguous_note_positions', values=notes))
+    return assigned, warnings
 
 
 def normalize_row(row):
-    municipality = row[0]
-    objects = split_cell(row[1])
-    insurance_numbers = split_cell(row[2])
-    notes = split_cell(row[3])
-
-    unswitched_terminal = clean_text(row[4])
-    first_disconnect_point = clean_text(row[5])
-    disconnect_point_outgoing = split_and_clean(row[6])
-    source_names = split_and_clean(row[7])
-    source_outgoing = split_and_clean(row[8])
-
-    if not objects:
-        return []
-
-    result = []
-    n_obj, n_ins, n_notes = len(objects), len(insurance_numbers), len(notes)
-
-    def make_entry(i, note_list):
-        return {
-            "municipality": municipality,
-            "object": objects[i],
-            "insurance_number": insurance_numbers[i] if i < n_ins else None,
-            "connection_notes": note_list,
-            "unswitched_terminal": unswitched_terminal,
-            "first_disconnect_point": first_disconnect_point,
-            "disconnect_point_outgoing": disconnect_point_outgoing,
-            "source_name": source_names[0] if source_names else None,
-            "source_outgoing": source_outgoing,
-        }
-
-    if n_obj == n_notes:
-        for i in range(n_obj):
-            result.append(make_entry(i, [notes[i]]))
-    elif n_obj == 1:
-        result.append(make_entry(0, notes))
-    elif n_notes <= n_obj:
-        for i in range(n_obj):
-            per_obj_notes = [notes[i]] if i < n_notes else []
-            result.append(make_entry(i, per_obj_notes))
-    else:
-        if is_technical(notes):
-            for i in range(n_obj):
-                result.append(make_entry(i, notes))
+    row = list(row) + [None] * max(0, 9 - len(row))
+    # Retain trailing layout lines, which may hold notes for the last object.
+    objects = [line.strip() for line in str(row[1] or '').replace('\xa0', ' ').replace('\r\n', '\n').replace('\r', '\n').split('\n')]
+    insurance = split_positional(row[2])
+    notes, warnings = assign_notes(objects, split_positional(row[3]))
+    if any(number and (i >= len(objects) or not objects[i]) for i, number in enumerate(insurance)):
+        warnings.append(dict(field='insurance_numbers', reason='unassigned_insurance_number', values=insurance))
+    invalid = any(w['reason'] in ('ambiguous_note_positions', 'unassigned_insurance_number') for w in warnings)
+    sources = split_compact(row[7])
+    entries = [dict(
+        municipality=clean_text(row[0]), object=name,
+        insurance_number=insurance[i] if i < len(insurance) else None,
+        insurance_numbers=[insurance[i]] if i < len(insurance) and insurance[i] else [],
+        connection_notes=notes[i], unswitched_terminal=clean_text(row[4]),
+        first_disconnect_point=clean_text(row[5]),
+        disconnect_point_outgoing=split_compact(row[6]),
+        source_name=sources[0] if sources else None, source_names=sources,
+        source_outgoing=split_compact(row[8]), _warnings=warnings, _skip_import=invalid,
+    ) for i, name in enumerate(objects) if name]
+    # Several insured structures can share an address and connection.
+    grouped = {}
+    for entry in entries:
+        key = normalize_object_name(entry['object'])
+        if key not in grouped:
+            grouped[key] = entry
         else:
-            for i in range(n_obj):
-                per_obj_notes = [notes[i]] if i < n_notes else []
-                result.append(make_entry(i, per_obj_notes))
+            target = grouped[key]
+            for field in ('insurance_numbers', 'connection_notes'):
+                target[field] = list(dict.fromkeys(target[field] + entry[field]))
+            target['insurance_number'] = target['insurance_numbers'][0] if len(target['insurance_numbers']) == 1 else None
+    if not grouped and any(clean_text(value) for value in row):
+        return [dict(object=None, _warnings=warnings + [dict(field='building', reason='empty_object_name')], _skip_import=True)]
+    return list(grouped.values())
 
-    return result
+
+def entry_value(entry, key, alias=None):
+    # Explicit [] takes precedence over an alias; None is unknown, not deletion.
+    return entry[key] if key in entry else entry.get(alias)
 
 
-async def import_service_connections(raw_entries: list[dict], session: AsyncSession):
-    imported_connections = []
-    errors = []
+def source_values(entry):
+    primary = split_compact(entry_value(entry, 'source_name', 'speisung'))
+    sources = split_compact(entry.get('source_names'))
+    # source_name remains the public editable field. source_names supplements it.
+    if len(primary) > 1:
+        return primary
+    return sources if sources and (not primary or primary[0] == sources[0]) else primary
 
+
+async def _import_connections(raw_entries, session, objects, report, *, replace_existing=False):
+    prepared = defaultdict(list)
+    blocked = set()
+    buildings = {}
+    insurance_by_building = defaultdict(list)
+    object_statuses = defaultdict(list)
+    name_locations = defaultdict(set)
     for entry in raw_entries:
-        object_display_name = str(entry.get("object") or entry.get("objekt") or "").strip()
-        if not object_display_name:
+        name_locations[normalize_object_name(entry.get('object') or entry.get('objekt'))].add(
+            clean_text(entry.get('municipality') or entry.get('gemeinde')))
+    for row_number, entry in enumerate(raw_entries, 1):
+        display = clean_text(entry.get('object') or entry.get('objekt'))
+        location = clean_text(entry.get('municipality') or entry.get('gemeinde'))
+        scope = (location, normalize_object_name(display))
+        context = dict(object=display, location=location, row=entry.get('_excel_row', row_number))
+        report['warnings'].extend({**w, **context} for w in entry.get('_warnings', []))
+        if entry.get('_skip_import'):
+            blocked.add(scope)
+            report['skipped'] += 1
             continue
-
-        normalized_object_name = object_display_name.replace(" ", "")
-
-        result = await session.execute(select(Object).where(Object.name == normalized_object_name))
-        db_obj = result.scalar_one_or_none()
-        if not db_obj:
-            db_obj = Object(
-                name=normalized_object_name,
-                friendly_name=object_display_name,
-                type="building",
-                location=(entry.get("municipality") or entry.get("gemeinde") or "").strip() or None,
-            )
-            session.add(db_obj)
-            await session.flush()
-
-        async def find_object(field_name, name):
-            if not name:
-                return None
-            normalized = str(name).replace(" ", "")
-            result_inner = await session.execute(select(Object).where(Object.name == normalized))
-            found = result_inner.scalar_one_or_none()
-            if not found and field_name in ["building", "transformer"]:
-                errors.append(
-                    {
-                        "object": object_display_name,
-                        "field": field_name,
-                        "missing_reference": name,
-                    }
-                )
-            return found
-
-        disconnect_point_obj = await find_object(
-            "disconnect_point", entry.get("unswitched_terminal") or entry.get("tk_ohne_schalt")
-        )
-        distribution_box_obj = await find_object(
-            "distribution_box", entry.get("first_disconnect_point") or entry.get("erste_trennstelle")
-        )
-        transformer_obj = await find_object("transformer", entry.get("source_name") or entry.get("speisung"))
-
-        if not transformer_obj:
+        if not display:
+            report['warnings'].append(dict(**context, field='building', reason='empty_object_name'))
+            report['skipped'] += 1
             continue
-
-        source_outgoing = entry.get("source_outgoing") or entry.get("abgang_speisung") or []
-        if isinstance(source_outgoing, str):
-            source_outgoing = [source_outgoing]
-
-        connection_notes = entry.get("connection_notes") or entry.get("bemerkungen") or []
-        if isinstance(connection_notes, str):
-            connection_notes = [connection_notes]
-
-        disconnect_outgoing = entry.get("disconnect_point_outgoing") or entry.get("abgang_trennstelle") or []
-        if isinstance(disconnect_outgoing, str):
-            disconnect_outgoing = [disconnect_outgoing]
-
-        service_connection = ServiceConnection(
-            building_id=db_obj.id,
-            transformer_id=transformer_obj.id,
-            distribution_box_id=distribution_box_obj.id if distribution_box_obj else None,
-            disconnect_point_id=disconnect_point_obj.id if disconnect_point_obj else None,
-            disconnect_point_outgoing=disconnect_outgoing,
-            source_outgoing=source_outgoing,
-            connection_notes=connection_notes,
-        )
-        session.add(service_connection)
-        imported_connections.append(service_connection)
-
-    await session.commit()
-    return {"imported": imported_connections, "errors": errors}
-
-
-async def import_gps_objects(import_data: GPSImportData, session: AsyncSession):
-    imported_objects = []
-
-    for point in import_data.points:
-        obj_type = point.type if point.type else "distribution_box"
-
+        if not location:
+            report['warnings'].append(dict(**context, field='building', reason='missing_municipality'))
+            report['skipped'] += 1
+            blocked.add(scope)
+            continue
+        sources = unique_reference_names(source_values(entry))
+        if len(sources) > 1:
+            report['warnings'].append(dict(**context, field='transformer', reason='multiple_sources_single_transformer', values=sources, selected=sources[0]))
+            if replace_existing:
+                blocked.add(scope)
+                report['skipped'] += 1
+                continue
+        references = {}
+        failed = False
+        for field, name in (
+            ('disconnect_point', entry_value(entry, 'unswitched_terminal', 'tk_ohne_schalt')),
+            ('distribution_box', entry_value(entry, 'first_disconnect_point', 'erste_trennstelle')),
+            ('transformer', sources[0] if sources else None),
+        ):
+            explicit_clear = name == ''
+            names = unique_reference_names(name)
+            if len(names) > 1:
+                report['warnings'].append(dict(**context, field=field,
+                    reason='multiple_distinct_references', values=names))
+                failed = True
+                continue
+            name = names[0] if names else None
+            if not name and field != 'transformer':
+                if explicit_clear or replace_existing:
+                    references[field + '_id'] = None
+                continue
+            try:
+                found, alias_used = find_reference_object(objects, name, location) if name else (None, False)
+                reason = 'object_not_found'
+            except AmbiguousMatch:
+                found, reason = None, 'ambiguous_object_reference'
+            if found:
+                references[field + '_id'] = found.id
+                if alias_used:
+                    report['warnings'].append(dict(**context, field=field, reason='reference_alias_matched',
+                        source_name=name, matched_name=found.name, matched_id=found.id))
+            else:
+                report['warnings'].append(dict(**context, field=field, missing_reference=name, reason=reason))
+                failed = True
+        if failed:
+            blocked.add(scope)
+            # An unresolved explicit reference must not partially change a connection.
+            report['skipped'] += 1
+            continue
         try:
-            obj_type_enum = ObjectType(obj_type)
-        except ValueError:
-            obj_type_enum = ObjectType.distribution_box
+            building, status = await upsert_object(session, objects, name=display, location=location,
+                ckw_id=entry.get('ckw_id'), type=ObjectType.building,
+                allow_locationless=not replace_existing and len(name_locations[scope[1]]) == 1)
+        except AmbiguousMatch as exc:
+            blocked.add(scope)
+            report['warnings'].append(dict(**context, field='building', reason='ambiguous_object', detail=str(exc)))
+            report['skipped'] += 1
+            continue
+        report['objects'][status] += 1
+        object_statuses[building.id].append(status)
+        numbers = split_compact(entry_value(entry, 'insurance_numbers', 'insurance_number'))
+        buildings[building.id] = building
+        insurance_by_building[building.id].extend(numbers)
+        if numbers and not replace_existing:
+            combined = list(dict.fromkeys((building.insurance_numbers or []) + numbers))
+            if combined != building.insurance_numbers:
+                building.insurance_numbers = combined
+                if status == 'unchanged':
+                    report['objects']['unchanged'] -= 1
+                    report['objects']['updated'] += 1
+        values = dict(building_id=building.id, **references)
+        for field, alias in (('source_outgoing', 'abgang_speisung'), ('disconnect_point_outgoing', 'abgang_trennstelle'), ('connection_notes', 'bemerkungen')):
+            value = entry_value(entry, field, alias)
+            if value is not None:
+                if isinstance(value, (list, tuple)) and any(v is None for v in value):
+                    report['warnings'].append(dict(**context, field=field, reason='null_array_item_ignored'))
+                    if not split_compact(value):
+                        continue
+                values[field] = split_compact(value)
+        prepared[building.id].append((values, context))
 
-        result = await session.execute(select(Object).where(Object.name == point.name))
-        existing_obj = result.scalar_one_or_none()
+    for building_id, rows in prepared.items():
+        candidates = list((await session.scalars(select(ServiceConnection).where(ServiceConnection.building_id == building_id))).all())
+        if replace_existing:
+            building = buildings[building_id]
+            if (clean_text(building.location), normalize_object_name(building.name)) in blocked:
+                report['warnings'].append(dict(object=building.friendly_name or building.name,
+                    location=building.location, field='connection', reason='replacement_blocked_by_incomplete_building'))
+                report['skipped'] += len(rows)
+                continue
+            success = await replace_building_connections(session, building, rows, candidates, report)
+            if success:
+                numbers = list(dict.fromkeys(insurance_by_building[building_id]))
+                if building.insurance_numbers != numbers:
+                    building.insurance_numbers = numbers
+                    if all(s == 'unchanged' for s in object_statuses[building_id]):
+                        report['objects']['unchanged'] -= 1
+                        report['objects']['updated'] += 1
+            continue
+        signatures = {build_connection_signature(values) for values, _ in rows}
+        seen = set()
+        for values, context in rows:
+            signature = build_connection_signature(values)
+            if signature in seen:
+                report['warnings'].append(dict(**context, field='connection', reason='duplicate_in_batch'))
+            seen.add(signature)
+            try:
+                connection_warnings = []
+                connection, status = await upsert_service_connection(
+                    session, candidates, values, signatures, warnings=connection_warnings)
+                report['warnings'].extend({**w, **context} for w in connection_warnings)
+            except AmbiguousMatch as exc:
+                report['warnings'].append(dict(**context, field='connection', reason='ambiguous_connection', detail=str(exc)))
+                report['skipped'] += 1
+                continue
+            report[status] += 1
+            report['imported'].append(connection)
 
-        geom_point = WKTElement(f"POINT({point.lon} {point.lat})", srid=4326)
 
-        if existing_obj:
-            existing_obj.type = obj_type_enum
-            existing_obj.ckw_id = point.ckw_id
-            existing_obj.geom = geom_point
-            session.add(existing_obj)
-            imported_objects.append(existing_obj)
-        else:
-            db_obj = Object(
-                name=point.name,
-                friendly_name=None,
-                type=obj_type_enum,
-                ckw_id=point.ckw_id,
-                geom=geom_point,
-            )
-            session.add(db_obj)
-            imported_objects.append(db_obj)
+async def import_service_connections(raw_entries: list[dict], session: AsyncSession, *,
+                                     replace_existing=False, dry_run=False):
+    if replace_existing:
+        required = ('unswitched_terminal', 'first_disconnect_point', 'source_outgoing',
+                    'disconnect_point_outgoing', 'connection_notes', 'insurance_numbers')
+        if not raw_entries or any(
+            not clean_text(e.get('municipality')) or not clean_text(e.get('object')) or
+            any(key not in e for key in required) or
+            any(not isinstance(e[key], list) or any(v is None for v in e[key])
+                for key in required[2:]) for e in raw_entries):
+            raise ValueError('Replacement requires complete Excel rows with municipality, object and all connection fields')
+    report = new_report()
+    report.update(dry_run=dry_run, mode='replace_buildings' if replace_existing else 'merge',
+                  deleted=0, consolidated=0, removed_connections=[])
+    async with import_transaction(session, dry_run=dry_run):
+        await _import_connections(raw_entries, session, await load_objects(session), report,
+                                  replace_existing=replace_existing)
+    return report
 
-    await session.commit()
-    return imported_objects
+
+async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, *, return_report=False):
+    report = new_report()
+    async with import_transaction(session):
+        objects = await load_objects(session)
+        for point in import_data.points:
+            obj_type = point.type
+            if obj_type:
+                try:
+                    obj_type = ObjectType(obj_type)
+                except ValueError:
+                    report['warnings'].append(dict(object=point.name, field='type', reason='invalid_object_type', value=obj_type))
+                    obj_type = None
+            try:
+                existing = find_existing_object(objects, point.name, point.location, point.ckw_id)
+                obj, status = await upsert_object(
+                    session, objects, name=point.name, location=point.location, ckw_id=point.ckw_id,
+                    type=obj_type or (existing.type if existing else ObjectType.distribution_box),
+                    geom=WKTElement(f'POINT({point.lon} {point.lat})', srid=4326),
+                )
+            except AmbiguousMatch as exc:
+                report['warnings'].append(dict(object=point.name, field='object', reason='ambiguous_object', detail=str(exc)))
+                report['skipped'] += 1
+                continue
+            report[status] += 1
+            report['imported'].append(obj)
+    return report if return_report else report['imported']
 
 
 async def import_to_db(import_data: ImportData):
+    """Legacy endpoint still creates named references, using shared upserts."""
+    report = new_report()
     async with AsyncSessionLocal() as session:
-        name_to_obj = {}
-
-        for obj in import_data.objects:
-            geom_point = None
-            if obj.lon is not None and obj.lat is not None:
-                geom_point = WKTElement(f"POINT({obj.lon} {obj.lat})", srid=4326)
-            db_obj = Object(
-                name=obj.name,
-                type=obj.type.value,
-                description=obj.description,
-                location=obj.location,
-                geom=geom_point,
-            )
-            session.add(db_obj)
-            name_to_obj[obj.name] = db_obj
-
-        await session.flush()
-
-        for connection in import_data.service_connections:
-            try:
-                db_connection = ServiceConnection(
-                    building_id=name_to_obj[connection.building_name].id,
-                    transformer_id=name_to_obj[connection.transformer_name].id,
-                    distribution_box_id=name_to_obj[connection.distribution_box_name].id if connection.distribution_box_name else None,
-                    disconnect_point_id=name_to_obj[connection.disconnect_point_name].id if connection.disconnect_point_name else None,
-                    disconnect_point_outgoing=connection.disconnect_point_outgoing,
-                    source_outgoing=connection.source_outgoing,
-                    connection_notes=connection.connection_notes,
-                )
-            except KeyError as e:
-                print(f"Warning: missing object reference for service connection: {e}")
-                continue
-            session.add(db_connection)
-
-        await session.commit()
+        async with import_transaction(session):
+            objects = await load_objects(session)
+            # raw_entries retain municipality and missing-vs-empty semantics that
+            # the historical validator's name-only object map would discard.
+            for entry in import_data.raw_entries:
+                if entry.get('_skip_import'):
+                    continue
+                for field, alias, obj_type in (
+                    ('unswitched_terminal', 'tk_ohne_schalt', ObjectType.disconnect_point),
+                    ('first_disconnect_point', 'erste_trennstelle', ObjectType.distribution_box),
+                    ('source_name', 'speisung', ObjectType.transformer),
+                ):
+                    names = source_values(entry) if field == 'source_name' else split_compact(entry_value(entry, field, alias))
+                    for name in names:
+                        try:
+                            _, status = await upsert_object(session, objects, name=name, type=obj_type)
+                            report['objects'][status] += 1
+                        except AmbiguousMatch as exc:
+                            report['warnings'].append(dict(object=name, field=field, reason='ambiguous_object', detail=str(exc)))
+            await _import_connections(import_data.raw_entries, session, objects, report)
+    return report

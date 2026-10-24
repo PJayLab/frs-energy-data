@@ -6,6 +6,8 @@ Backend service for importing and searching electricity grid object/location dat
 
 - Import object and connection data from Excel and JSON.
 - Import GPS points for grid objects.
+- Resolve repeated multiline grid references and unique `str.`/`strasse` aliases.
+- Synchronize equivalent connection duplicates while preserving their IDs.
 - Search addresses with tokenized/fuzzy-friendly matching.
 - Retrieve one address by UUID.
 - Find nearby addresses by coordinate and radius.
@@ -13,7 +15,10 @@ Backend service for importing and searching electricity grid object/location dat
 ## Data model (high level)
 
 ### `objects`
-Stores physical entities (building, transformer, distribution box, disconnect point) and optional geometry.
+Stores physical entities (building, transformer, distribution box, disconnect point), optional geometry,
+and `insurance_numbers` (the building-related `Assek. Nr.` values from Excel).
+These identifiers preserve leading zeroes, may be shared across addresses, and
+are separate from `ckw_id`. Multiple numbers per address are supported.
 
 ### `service_connections`
 Stores only connection-related information between referenced objects:
@@ -52,6 +57,11 @@ Stores only connection-related information between referenced objects:
 pip install -r requirements.txt
 ```
 
+SQLAlchemy is installed with its `asyncio` extra to include `greenlet`, which
+the asynchronous database layer requires. After changing dependencies, rebuild
+the Docker image and recreate the container; restarting an existing container
+does not install updated requirements.
+
 2. Configure PostgreSQL/PostGIS connection in `database.py` if needed.
 
 3. Start app (example):
@@ -62,5 +72,25 @@ uvicorn main:app --reload
 
 ## Notes
 
-- This repository currently contains schema-level refactors without database migration scripts.
-- If you already have deployed tables, add a migration before rolling out.
+- Import responses count `created`, `updated`, and `unchanged` entries in
+  `imported_count`. An unchanged entry was processed successfully.
+  `warnings_by_reason` summarizes diagnostics. Missing or ambiguous references
+  still require source data or explicit correction; they are not guessed.
+- Equivalent existing connections (same full path, outgoing arrays and notes)
+  can be synchronized together. Conflicting duplicates remain skipped.
+
+- Import matching, update rules, limitations and regression tests are documented in
+  [docs/import-behavior.md](docs/import-behavior.md).
+
+- Before deploying this version to an existing database, apply
+  [migrations/001_object_insurance_numbers.sql](migrations/001_object_insurance_numbers.sql).
+  Startup `create_all()` does not add columns to existing tables. The migration
+  only adds the nullable column; reimport the Excel file to populate it.
+- Excel imports preserve multiline note blocks and collect multiple insurance
+  numbers for repeated addresses. Ambiguous positions are reported and skipped.
+  Reimports add numbers without deleting previously recorded ones.
+- Address and connection details expose `insurance_numbers`. Search responses
+  can include them with `fields=insurance_numbers`.
+- Run import regressions with `python -m unittest discover -s tests -v`.
+  Set `TEST_POSTGRES_URL` only for a dedicated PostGIS test database to run
+  the optional PostgreSQL integration suite.
