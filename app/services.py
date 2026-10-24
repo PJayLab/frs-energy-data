@@ -367,6 +367,7 @@ async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, 
                 obj, status = await upsert_object(
                     session, objects, name=point.name, location=point.location, ckw_id=point.ckw_id,
                     distinct_assets=True,
+                    format_display=True,
                     type=obj_type or (existing.type if existing else ObjectType.distribution_box),
                     geom=WKTElement(f'POINT({point.lon} {point.lat})', srid=4326),
                 )

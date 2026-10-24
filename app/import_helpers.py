@@ -25,10 +25,18 @@ def normalize_object_name(value):
 
 
 def reference_name_key(value):
-    """Conservative reference-only aliases; never remove house numbers/punctuation."""
+    """Reference aliases preserve numbers; terminal numeric parentheses are layout."""
     value = unicodedata.normalize('NFC', clean_text(value) or '').casefold()
     value = re.sub(r'str\.(?=\s|\w|$)', 'strasse', value)
+    value = re.sub(r'(?<=\D)\s*\(\s*(\d+[a-z]?)\s*\)$', r' \1', value)
     return ''.join(value.split())
+
+
+def format_gps_name(value):
+    """Space terminal numbers in display names; stored identities stay unchanged."""
+    value = clean_text(value) or ''
+    value = re.sub(r'\s*\(\s*(\d+[a-zA-Z]?)\s*\)$', r' (\1)', value)
+    return re.sub(r'(?<=[^\W\d_])(?=\d+[a-zA-Z]?$)', ' ', value)
 
 
 def unique_reference_names(value):
@@ -192,6 +200,7 @@ def find_reference_object(objects, name, location=None, *, expected_type=None,
                           building=None, diagnostics=None, use_nearest=False):
     # "Erste Trennstelle" is a connection role, not exclusively a cabinet.
     allowed_types = (('distribution_box', 'transformer') if expected_type == 'distribution_box'
+                     else ('disconnect_point', 'distribution_box') if expected_type == 'disconnect_point'
                      else (expected_type,) if expected_type else None)
     if use_nearest:
         exact = objects.names[normalize_object_name(name)] if isinstance(objects, ObjectIndex) else [o for o in objects if normalize_object_name(o.name) == normalize_object_name(name)]
@@ -233,13 +242,16 @@ async def upsert_object(session, objects, *, name, location=None, ckw_id=None, d
         raise AmbiguousMatch('Empty object name')
     allow_locationless = attributes.pop('allow_locationless', True)
     distinct_assets = attributes.pop('distinct_assets', False)
+    format_display = attributes.pop('format_display', False)
     existing = find_existing_object(objects, display, location, ckw_id,
         expected_type=attributes.get('type'), allow_locationless=allow_locationless,
         distinct_assets=distinct_assets)
     values = dict(name=normalize_object_name(display), location=clean_text(location), ckw_id=clean_text(ckw_id), **attributes)
     # Compact GPS names must not destroy a previously formatted display name.
     if not existing or not existing.friendly_name or normalize_object_name(existing.friendly_name) != values['name'] or display != values['name']:
-        values['friendly_name'] = display
+        values['friendly_name'] = format_gps_name(display) if format_display else display
+    elif format_display:
+        values['friendly_name'] = format_gps_name(existing.friendly_name)
     if existing is None:
         existing = Object(id=gen_short_id(), **{key: value for key, value in values.items() if value is not None})
         session.add(existing)

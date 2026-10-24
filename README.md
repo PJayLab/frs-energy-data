@@ -18,6 +18,12 @@ guarantee completion within a particular proxy or client timeout.
 
 ## Excel first disconnect location
 
+The `TK ohne Schaltmöglichkeit` column (`disconnect_point` connection role)
+accepts both disconnect points and distribution boxes. Exact names, aliases
+and nearest-reference resolution use both types, including during merge updates.
+The referenced object's type and ID remain unchanged. Buildings and transformer
+stations are not eligible for this role.
+
 The Excel `Erste Trennstelle` column accepts both distribution boxes and
 transformer stations. A station such as `SUR-Fruchthof` may be referenced by both
 the supply and first disconnect fields using the same object ID. The importer
@@ -264,3 +270,18 @@ HTTP 422. Filtering happens in the database before the nearest-result limit
 (default 100, maximum 500). Each result includes its `type`. Objects without
 coordinates cannot appear in a radius search. Disconnect points were already
 eligible for unfiltered nearby searches; no type was previously excluded.
+## Reference names and GPS display formatting
+
+Excel reference matching ignores whitespace and accepts a terminal house number
+in parentheses: `Birkenweg(5)`, `Birkenweg (5)` and `Birkenweg 5` can resolve to
+the same infrastructure object. A single letter suffix is supported (`5A`).
+Other parenthetical text, number ranges and different house numbers remain
+distinct. Exact matches take precedence; ambiguous aliases still require the
+existing geographic resolution rules and are skipped if they cannot be resolved.
+This also works with previously imported objects without a GPS reimport.
+
+GPS imports format `friendly_name` as `Birkenweg (5)` or `Birkenweg 5A` on
+creation and update. Matching identities (`name`, CKW ID) are not changed by
+display formatting. An existing readable display name is preserved where possible.
+These aliases only address formatting differences; missing infrastructure,
+incompatible types and unresolved ambiguous references can still be skipped.

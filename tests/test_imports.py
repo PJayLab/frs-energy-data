@@ -601,10 +601,41 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         await self.session.commit()
         entry = services.normalize_row(row())[0]
         for field, name in [('first_disconnect_point', 'OnlyBuilding'),
+                            ('unswitched_terminal', 'OnlyBuilding'),
                             ('source_name', 'OnlyBox'), ('unswitched_terminal', 'Transformer A')]:
             result = await services.import_service_connections([{**entry, field: name}], self.session)
             self.assertEqual(result['skipped'], 1)
         self.assertEqual(await self.connections(), [])
+
+    async def test_disconnect_role_accepts_box_exact_alias_and_merge_update(self):
+        box = Object(name='Birkenweg(5)', type='distribution_box')
+        old = Object(name='OldTK', type='disconnect_point')
+        self.session.add_all([box, old])
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        await services.import_service_connections([{**entry, 'unswitched_terminal': 'OldTK'}], self.session)
+        connection_id = (await self.connections())[0].id
+        for name in ('Birkenweg 5', 'Birkenweg(5)'):
+            result = await services.import_service_connections(
+                [{**entry, 'unswitched_terminal': name}], self.session)
+            self.assertEqual(result['skipped'], 0)
+            connections = await self.connections()
+            self.assertEqual(len(connections), 1)
+            self.assertEqual((connections[0].id, connections[0].disconnect_point_id), (connection_id, box.id))
+            self.assertEqual(box.type, 'distribution_box')
+
+    async def test_disconnect_role_nearest_across_compatible_types(self):
+        building = Object(name='Haus1', type='building', location='A', geom=WKTElement('POINT(8 47)', srid=4326))
+        box = Object(name='Sternen', type='distribution_box', geom=WKTElement('POINT(8.001 47)', srid=4326))
+        terminal = Object(name='Sternen', type='disconnect_point', geom=WKTElement('POINT(8.2 47)', srid=4326))
+        self.session.add_all([building, box, terminal])
+        await self.session.commit()
+        entry = services.normalize_row(row('Haus 1'))[0]
+        result = await services.import_service_connections(
+            [{**entry, 'unswitched_terminal': 'Sternen'}], self.session)
+        self.assertEqual(result['created'], 1)
+        self.assertEqual((await self.connections())[0].disconnect_point_id, box.id)
+        self.assertIn('nearest_reference_matched', [w['reason'] for w in result['warnings']])
 
     async def test_alias_collision_and_different_house_number_are_not_guessed(self):
         self.session.add_all([Object(name=n, type='distribution_box', location='A')
@@ -624,6 +655,46 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         await upsert_object(self.session, objects, name='Feldstr. B', ckw_id='box-asset')
         self.assertIsNone(find_reference_object(objects, 'Eggstrasse A')[0])
         self.assertIs(find_reference_object(objects, 'Feldstrasse B')[0], box)
+
+    async def test_parenthesized_house_number_reference_and_repeat_import(self):
+        box = Object(name='Birkenweg(5)', type='distribution_box')
+        self.session.add(box)
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        for name in ('Birkenweg 5', 'Birkenweg(5)', 'Birkenweg (5)'):
+            result = await services.import_service_connections(
+                [{**entry, 'first_disconnect_point': name}], self.session)
+            self.assertEqual(result['skipped'], 0)
+            self.assertEqual((await self.connections())[0].distribution_box_id, box.id)
+        self.assertEqual(len(await self.connections()), 1)
+        index = ObjectIndex([box])
+        for name in ('Birkenweg 6', 'Birkenweg 5A', 'Birkenweg (alt)', 'Birkenweg 5-7'):
+            self.assertIsNone(find_reference_object(index, name)[0])
+        self.assertEqual(find_reference_object(ObjectIndex([
+            Object(name='Birkenweg5A', type='distribution_box')]), 'Birkenweg (5A)')[0].name, 'Birkenweg5A')
+
+    async def test_parenthesized_reference_alias_collision_is_not_guessed(self):
+        self.session.add_all([Object(name=n, type='distribution_box')
+                             for n in ('Birkenweg(5)', 'BIRKENWEG(5)')])
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        result = await services.import_service_connections(
+            [{**entry, 'first_disconnect_point': 'Birkenweg 5'}], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertIn('ambiguous_object_reference', [w['reason'] for w in result['warnings']])
+
+    async def test_gps_formats_display_but_preserves_identity(self):
+        payload = GPSImportData(points=[dict(name='Birkenweg(5)', lon=8, lat=47, ckw_id='box-5')])
+        await services.import_gps_objects(payload, self.session)
+        obj = next(o for o in await self.objects() if o.ckw_id == 'box-5')
+        self.assertEqual((obj.name, obj.friendly_name), ('Birkenweg(5)', 'Birkenweg (5)'))
+        obj.friendly_name = 'Birkenweg(5)'
+        await self.session.commit()
+        await services.import_gps_objects(payload, self.session)
+        self.assertEqual(obj.friendly_name, 'Birkenweg (5)')
+        payload.points[0].name = 'Birkenweg5A'
+        await services.import_gps_objects(payload, self.session)
+        self.assertEqual((obj.name, obj.friendly_name), ('Birkenweg5A', 'Birkenweg 5A'))
 
     async def test_identical_connection_duplicates_update_without_deleting_ids(self):
         entry = services.normalize_row(row())[0]
