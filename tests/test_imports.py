@@ -16,7 +16,8 @@ from sqlalchemy.types import TypeDecorator
 from app.models import Object, ServiceConnection
 from app.schemas import GPSImportData, ImportData
 from app import services
-from app.api.import_router import import_excel
+from app.api.import_router import import_excel, import_response
+from app.import_helpers import ObjectIndex, find_reference_object, upsert_object
 from fastapi import UploadFile
 from openpyxl import Workbook
 
@@ -34,6 +35,14 @@ def row(objects='Chäppelimatt 5', notes='PVA: 30 kVA', municipality='A'):
 
 
 class ParsingTests(unittest.TestCase):
+    def test_response_summarizes_warnings_without_changing_success_counts(self):
+        report = dict(imported=[object(), object()], errors=[], warnings=[
+            {'reason': 'reference_alias_matched'}, {'reason': 'reference_alias_matched'},
+            {'reason': 'object_not_found'}], created=0, updated=1, unchanged=1, skipped=1)
+        response = import_response(report)
+        self.assertEqual(response['imported_count'], 2)
+        self.assertEqual(response['warnings_by_reason'], {'reference_alias_matched': 2, 'object_not_found': 1})
+
     def test_single(self):
         self.assertEqual(services.normalize_row(row())[0]['connection_notes'], ['PVA: 30 kVA'])
 
@@ -247,6 +256,105 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['skipped'], 1)
         self.assertEqual({w['field'] for w in result['warnings']}, {'transformer', 'disconnect_point', 'distribution_box'})
         self.assertEqual(await self.connections(), [])
+
+    async def test_repeated_references_keep_all_outgoing_positions(self):
+        self.session.add(Object(name='Box1', type='distribution_box'))
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        entry.update(source_name='Transformer A\nTransformer A',
+                     first_disconnect_point='Box 1\nBox 1', source_outgoing=['4', '5'])
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['created'], 1)
+        self.assertEqual(result['warnings'], [])
+        self.assertEqual((await self.connections())[0].source_outgoing, ['4', '5'])
+
+    async def test_distinct_multiline_box_references_stay_unresolved(self):
+        self.session.add_all([Object(name=name, type='distribution_box') for name in ('Box1', 'Box2')])
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        entry['first_disconnect_point'] = 'Box 1\nBox 2'
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(result['warnings'][0]['reason'], 'multiple_distinct_references')
+        self.assertEqual(await self.connections(), [])
+
+    async def test_reference_abbreviation_case_and_municipality(self):
+        box = Object(name='Eggstrasse11', location='A', type='distribution_box')
+        self.session.add_all([box, Object(name='Eggstrasse11', location='B', type='distribution_box')])
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        entry['first_disconnect_point'] = 'EGGSTR. 11'
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['created'], 1)
+        self.assertEqual((await self.connections())[0].distribution_box_id, box.id)
+        self.assertEqual(result['warnings'][0]['reason'], 'reference_alias_matched')
+        self.assertEqual(box.name, 'Eggstrasse11')
+
+    async def test_alias_collision_and_different_house_number_are_not_guessed(self):
+        self.session.add_all([Object(name=n, type='distribution_box', location='A')
+                              for n in ('Eggstrasse11', 'EGGSTRASSE11')])
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        for name, reason in [('Eggstr. 11', 'ambiguous_object_reference'), ('Eggstr. 12', 'object_not_found')]:
+            result = await services.import_service_connections([{**entry, 'first_disconnect_point': name}], self.session)
+            self.assertEqual(result['skipped'], 1)
+            self.assertEqual(result['warnings'][0]['reason'], reason)
+
+    async def test_reference_alias_index_follows_rename(self):
+        box = Object(name='Eggstr. A', ckw_id='box-asset', type='distribution_box')
+        self.session.add(box)
+        await self.session.flush()
+        objects = ObjectIndex([box])
+        await upsert_object(self.session, objects, name='Feldstr. B', ckw_id='box-asset')
+        self.assertIsNone(find_reference_object(objects, 'Eggstrasse A')[0])
+        self.assertIs(find_reference_object(objects, 'Feldstrasse B')[0], box)
+
+    async def test_identical_connection_duplicates_update_without_deleting_ids(self):
+        entry = services.normalize_row(row())[0]
+        await services.import_service_connections([entry], self.session)
+        original = (await self.connections())[0]
+        copy = ServiceConnection(building_id=original.building_id, transformer_id=original.transformer_id,
+            source_outgoing=original.source_outgoing, disconnect_point_outgoing=original.disconnect_point_outgoing,
+            connection_notes=original.connection_notes)
+        self.session.add(copy)
+        await self.session.commit()
+        ids = {original.id, copy.id}
+        entry['connection_notes'] = ['Corrected']
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['updated'], 1)
+        connections = await self.connections()
+        self.assertEqual({c.id for c in connections}, ids)
+        self.assertTrue(all(c.connection_notes == ['Corrected'] for c in connections))
+        self.assertEqual(result['warnings'][0]['reason'], 'duplicate_connections_synchronized')
+        self.assertEqual(set(result['warnings'][0]['connection_ids']), ids)
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['unchanged'], 1)
+
+    async def test_duplicate_connections_with_different_notes_stay_ambiguous(self):
+        entry = services.normalize_row(row())[0]
+        await services.import_service_connections([entry], self.session)
+        original = (await self.connections())[0]
+        copy = ServiceConnection(building_id=original.building_id, transformer_id=original.transformer_id,
+            source_outgoing=original.source_outgoing, disconnect_point_outgoing=original.disconnect_point_outgoing,
+            connection_notes=['Different note'])
+        self.session.add(copy)
+        await self.session.commit()
+        result = await services.import_service_connections([{**entry, 'connection_notes': ['New']}], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(original.connection_notes, ['PVA: 30 kVA'])
+        self.assertEqual(copy.connection_notes, ['Different note'])
+
+    async def test_partial_connection_payload_does_not_merge_different_paths(self):
+        entry = services.normalize_row(row())[0]
+        await services.import_service_connections([entry], self.session)
+        original = (await self.connections())[0]
+        self.session.add(ServiceConnection(building_id=original.building_id, transformer_id=original.transformer_id,
+            source_outgoing=['99'], disconnect_point_outgoing=original.disconnect_point_outgoing,
+            connection_notes=original.connection_notes))
+        await self.session.commit()
+        entry.pop('source_outgoing')
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['skipped'], 1)
 
     async def test_none_preserves_arrays(self):
         entry = services.normalize_row(row())[0]

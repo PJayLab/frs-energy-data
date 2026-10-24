@@ -6,6 +6,8 @@ Backend service for importing and searching electricity grid object/location dat
 
 - Import object and connection data from Excel and JSON.
 - Import GPS points for grid objects.
+- Resolve repeated multiline grid references and unique `str.`/`strasse` aliases.
+- Synchronize equivalent connection duplicates while preserving their IDs.
 - Search addresses with tokenized/fuzzy-friendly matching.
 - Retrieve one address by UUID.
 - Find nearby addresses by coordinate and radius.
@@ -69,6 +71,13 @@ uvicorn main:app --reload
 ```
 
 ## Notes
+
+- Import responses count `created`, `updated`, and `unchanged` entries in
+  `imported_count`. An unchanged entry was processed successfully.
+  `warnings_by_reason` summarizes diagnostics. Missing or ambiguous references
+  still require source data or explicit correction; they are not guessed.
+- Equivalent existing connections (same full path, outgoing arrays and notes)
+  can be synchronized together. Conflicting duplicates remain skipped.
 
 - Import matching, update rules, limitations and regression tests are documented in
   [docs/import-behavior.md](docs/import-behavior.md).

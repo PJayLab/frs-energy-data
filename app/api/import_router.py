@@ -1,4 +1,5 @@
 from io import BytesIO
+from collections import Counter
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from openpyxl import load_workbook
@@ -22,6 +23,7 @@ def import_response(result):
         "imported_count": len(result["imported"]),
         "errors_count": len(result["errors"]),
         "warnings_count": len(result["warnings"]),
+        "warnings_by_reason": dict(Counter(w.get('reason', 'unspecified') for w in result['warnings'])),
         **{key: value for key, value in result.items() if key != "imported"},
     }
 

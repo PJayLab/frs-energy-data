@@ -12,6 +12,7 @@ from app.import_helpers import (
     split_compact, normalize_array_for_comparison, find_existing_object,
     upsert_object, build_connection_signature, find_existing_service_connection,
     upsert_service_connection, import_transaction, new_report, load_objects,
+    unique_reference_names, find_reference_object,
 )
 
 
@@ -114,7 +115,7 @@ async def _import_connections(raw_entries, session, objects, report):
             report['skipped'] += 1
             continue
         location = clean_text(entry.get('municipality') or entry.get('gemeinde'))
-        sources = source_values(entry)
+        sources = unique_reference_names(source_values(entry))
         if len(sources) > 1:
             report['warnings'].append(dict(**context, field='transformer', reason='multiple_sources_single_transformer', values=sources, selected=sources[0]))
         references = {}
@@ -125,21 +126,27 @@ async def _import_connections(raw_entries, session, objects, report):
             ('transformer', sources[0] if sources else None),
         ):
             explicit_clear = name == ''
-            name = clean_text(name)
+            names = unique_reference_names(name)
+            if len(names) > 1:
+                report['warnings'].append(dict(**context, field=field,
+                    reason='multiple_distinct_references', values=names))
+                failed = True
+                continue
+            name = names[0] if names else None
             if not name and field != 'transformer':
                 if explicit_clear:
                     references[field + '_id'] = None
                 continue
             try:
-                found = find_existing_object(objects, name, location) if name else None
-                # Grid assets can feed buildings across municipal boundaries.
-                if not found and name:
-                    found = find_existing_object(objects, name)
+                found, alias_used = find_reference_object(objects, name, location) if name else (None, False)
                 reason = 'object_not_found'
             except AmbiguousMatch:
                 found, reason = None, 'ambiguous_object_reference'
             if found:
                 references[field + '_id'] = found.id
+                if alias_used:
+                    report['warnings'].append(dict(**context, field=field, reason='reference_alias_matched',
+                        source_name=name, matched_name=found.name, matched_id=found.id))
             else:
                 report['warnings'].append(dict(**context, field=field, missing_reference=name, reason=reason))
                 failed = True
@@ -183,7 +190,10 @@ async def _import_connections(raw_entries, session, objects, report):
                 report['warnings'].append(dict(**context, field='connection', reason='duplicate_in_batch'))
             seen.add(signature)
             try:
-                connection, status = await upsert_service_connection(session, candidates, values, signatures)
+                connection_warnings = []
+                connection, status = await upsert_service_connection(
+                    session, candidates, values, signatures, warnings=connection_warnings)
+                report['warnings'].extend({**w, **context} for w in connection_warnings)
             except AmbiguousMatch as exc:
                 report['warnings'].append(dict(**context, field='connection', reason='ambiguous_connection', detail=str(exc)))
                 report['skipped'] += 1

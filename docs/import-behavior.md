@@ -32,10 +32,19 @@ update existing values; missing values preserve them. GPS accepts optional
 `location`. Missing/invalid GPS type preserves an existing type, defaulting to
 `distribution_box` only for a new object; invalid types are reported.
 
-Referenced grid objects first use the same municipality matching. A unique
+Referenced grid objects first use exact municipality/name matching. If absent,
+a reference-only fallback normalizes Unicode, case and `str.` to `strasse`,
+preferring local candidates or historical candidates without location. A unique
 global fallback is allowed because a grid asset can feed another municipality.
-Names remain case sensitive. Missing municipality and historical missing
-locations can still make identity fundamentally uncertain.
+House numbers, accents and other punctuation remain significant. Alias matches
+are reported with the source name and matched ID. Multiple candidates still
+skip the entry. This does not rename objects or change building/GPS identity.
+
+Repeated identical names in multiline references are collapsed (ignoring
+whitespace only); outgoing arrays retain every value and their order. Distinct
+optional reference names in one cell are reported and skipped, not concatenated
+into a nonexistent object name. Duplicate source names no longer trigger the
+multiple-source warning; genuinely distinct sources retain the existing warning.
 
 Objects are indexed in memory once per import by normalized name and asset ID;
 new and renamed objects immediately update that index.
@@ -48,7 +57,8 @@ but **order is preserved** because outgoing positions can describe corresponding
 paths. Insurance numbers are not matching keys.
 
 - First match the connection signature. Unspecified fields are unknown and must
-  not contradict an existing value; multiple possible matches are ambiguous.
+  not contradict an existing value. Multiple matches are accepted only if all
+  full stored signatures and normalized notes agree.
 - If the building has one existing connection and the batch contains one distinct
   incoming signature for it, update the existing connection. This handles e.g.
   changing outgoing `4` to `5`, including updates to the referenced objects.
@@ -61,7 +71,11 @@ paths. Insurance numbers are not matching keys.
 There is no source-row ID or provenance field. Therefore a lone new connection
 cannot be distinguished perfectly from an edit to the sole existing connection.
 Likewise edits among multiple existing connections require clarification or an
-exact matching signature. Pre-existing duplicates are reported, not merged.
+exact matching signature. Equivalent pre-existing duplicates are synchronized
+and reported as `duplicate_connections_synchronized` with every affected ID.
+No record is deleted; issue-report references remain intact. Different stored
+notes or paths remain ambiguous, including differences in fields omitted from
+the incoming payload. Counts remain per input operation, not per duplicate copy.
 
 Supplied connection arrays/notes synchronize to the current import, including
 explicit `[]` to clear them. Missing keys and `None` preserve existing values.

@@ -1,6 +1,8 @@
 """Shared import identities and conservative update rules."""
 from contextlib import asynccontextmanager
 from collections import defaultdict
+import re
+import unicodedata
 from geoalchemy2.shape import to_shape
 from sqlalchemy import select, text
 from app.models import Object, ServiceConnection
@@ -14,6 +16,20 @@ def clean_text(value):
 
 def normalize_object_name(value):
     return ''.join((clean_text(value) or '').split())
+
+
+def reference_name_key(value):
+    """Conservative reference-only aliases; never remove house numbers/punctuation."""
+    value = unicodedata.normalize('NFC', clean_text(value) or '').casefold()
+    value = re.sub(r'str\.(?=\s|\w|$)', 'strasse', value)
+    return ''.join(value.split())
+
+
+def unique_reference_names(value):
+    names = {}
+    for name in split_compact(value):
+        names.setdefault(normalize_object_name(name), name)
+    return list(names.values())
 
 
 def split_positional(value):
@@ -46,6 +62,7 @@ class ObjectIndex(list):
         super().__init__()
         self.names = defaultdict(list)
         self.assets = defaultdict(list)
+        self.reference_names = defaultdict(list)
         for obj in objects:
             self.append(obj)
 
@@ -53,12 +70,15 @@ class ObjectIndex(list):
         super().append(obj)
         self.names[normalize_object_name(obj.name)].append(obj)
         self.assets[clean_text(obj.ckw_id)].append(obj)
+        self.reference_names[reference_name_key(obj.name)].append(obj)
 
     def reindex(self, obj, previous_name, previous_asset):
-        self.names[previous_name].remove(obj)
+        self.names[normalize_object_name(previous_name)].remove(obj)
         self.assets[previous_asset].remove(obj)
+        self.reference_names[reference_name_key(previous_name)].remove(obj)
         self.names[normalize_object_name(obj.name)].append(obj)
         self.assets[clean_text(obj.ckw_id)].append(obj)
+        self.reference_names[reference_name_key(obj.name)].append(obj)
 
 
 @asynccontextmanager
@@ -101,6 +121,26 @@ def find_existing_object(objects, name, location=None, ckw_id=None):
     return found
 
 
+def find_reference_object(objects, name, location=None):
+    # Preserve exact matching and its ambiguity checks before trying aliases.
+    found = find_existing_object(objects, name, location)
+    if found:
+        return found, False
+    key = reference_name_key(name)
+    candidates = (objects.reference_names[key] if isinstance(objects, ObjectIndex)
+                  else [o for o in objects if reference_name_key(o.name) == key])
+    if location:
+        local = [o for o in candidates if reference_name_key(o.location) == reference_name_key(location)]
+        unknown = [o for o in candidates if not clean_text(o.location)]
+        if local or unknown:
+            return _unique(local or unknown, f'reference={name}, location={location}'), True
+    # An exact global name is preferred over a global alias (cross-border assets).
+    found = find_existing_object(objects, name)
+    if found:
+        return found, False
+    return _unique(candidates, f'reference={name}'), True
+
+
 def _value_key(value):
     if hasattr(value, 'srid'):
         return (value.srid, to_shape(value).wkb_hex)
@@ -123,7 +163,7 @@ async def upsert_object(session, objects, *, name, location=None, ckw_id=None, *
         objects.append(existing)
         return existing, 'created'
     changed = False
-    previous_name, previous_asset = normalize_object_name(existing.name), clean_text(existing.ckw_id)
+    previous_name, previous_asset = existing.name, clean_text(existing.ckw_id)
     for key, value in values.items():
         if value is not None and _value_key(getattr(existing, key)) != _value_key(value):
             setattr(existing, key, value)
@@ -150,7 +190,9 @@ def find_existing_service_connection(candidates, values, incoming_signatures):
         for key, value in values.items() if key in CONNECTION_FIELDS + ARRAY_FIELDS
     )]
     if len(matches) > 1:
-        raise AmbiguousMatch('Multiple existing connections have the same signature')
+        if len({connection_content_key(c) for c in matches}) != 1:
+            raise AmbiguousMatch('Multiple existing connections differ in stored fields or notes')
+        return min(matches, key=lambda c: c.id)
     if matches:
         return matches[0]
     if len(candidates) == 1 and len(incoming_signatures) == 1:
@@ -160,7 +202,11 @@ def find_existing_service_connection(candidates, values, incoming_signatures):
     return None
 
 
-async def upsert_service_connection(session, candidates, values, incoming_signatures):
+def connection_content_key(connection):
+    return build_connection_signature(connection), normalize_array_for_comparison(connection.connection_notes)
+
+
+async def upsert_service_connection(session, candidates, values, incoming_signatures, *, warnings=None):
     existing = find_existing_service_connection(candidates, values, incoming_signatures)
     if existing is None:
         existing = ServiceConnection(**values)
@@ -168,11 +214,18 @@ async def upsert_service_connection(session, candidates, values, incoming_signat
         await session.flush()
         candidates.append(existing)
         return existing, 'created'
+    # Preserve every ID (including issue-report references). Only equivalent
+    # records can be synchronized; differences still require explicit review.
+    copies = [c for c in candidates if connection_content_key(c) == connection_content_key(existing)]
+    if len(copies) > 1 and warnings is not None:
+        warnings.append(dict(field='connection', reason='duplicate_connections_synchronized',
+                             connection_ids=sorted(c.id for c in copies)))
     changed = False
-    for key, value in values.items():
-        if getattr(existing, key) != value:
-            setattr(existing, key, value)
-            changed = True
+    for copy in copies:
+        for key, value in values.items():
+            if getattr(copy, key) != value:
+                setattr(copy, key, value)
+                changed = True
     return existing, 'updated' if changed else 'unchanged'
 
 
