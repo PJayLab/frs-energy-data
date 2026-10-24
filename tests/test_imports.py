@@ -52,12 +52,47 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual([e['insurance_number'] for e in entries], ['0333', '0335'])
         self.assertEqual(entries[1]['connection_notes'], ['Third'])
 
-    def test_fallbacks(self):
+    def test_ambiguous_overflow_is_not_broadcast_or_silently_truncated(self):
         technical = services.normalize_row(row('A\nB', 'PVA\nx\ny'))
-        self.assertEqual(technical[1]['connection_notes'], ['PVA', 'x', 'y'])
+        self.assertTrue(all(e['_skip_import'] for e in technical))
         ordinary = services.normalize_row(row('A\nB', 'x\ny\nz'))
-        self.assertEqual(ordinary[1]['connection_notes'], ['y'])
+        self.assertTrue(all(e['_skip_import'] for e in ordinary))
         self.assertTrue(ordinary[0]['_warnings'])
+
+    def test_continuation_notes_and_leading_zeroes(self):
+        data = list(row('Büntenweg 8\n\nBüntenweg 10', 'PVA: 12.5 kVA\nLadestation: 11 kVA'))
+        data[2] = '0290\n\n0289'
+        entries = services.normalize_row(data)
+        self.assertEqual([e['insurance_numbers'] for e in entries], [['0290'], ['0289']])
+        self.assertEqual([e['connection_notes'] for e in entries], [['PVA: 12.5 kVA', 'Ladestation: 11 kVA'], []])
+        self.assertFalse(any(e['_skip_import'] for e in entries))
+
+    def test_trailing_continuation_and_parallel_note(self):
+        entries = services.normalize_row(row('A\nB\n', '\nPVA: 9 kVA\nLadestation: 11 kVA\nParallel Strang 1+2'))
+        self.assertEqual(entries[0]['connection_notes'], ['Parallel Strang 1+2'])
+        self.assertEqual(entries[1]['connection_notes'], ['PVA: 9 kVA', 'Ladestation: 11 kVA', 'Parallel Strang 1+2'])
+        self.assertFalse(any(e['_skip_import'] for e in entries))
+
+    def test_unassigned_number_is_not_shifted(self):
+        for objects, numbers in [('A\n\nB', '01\n02\n03'), ('A', '01\n02')]:
+            data = list(row(objects, None))
+            data[2] = numbers
+            entries = services.normalize_row(data)
+            self.assertTrue(all(e['_skip_import'] for e in entries))
+            self.assertEqual(entries[0]['_warnings'][0]['reason'], 'unassigned_insurance_number')
+
+    def test_repeated_address_collects_numbers_and_notes(self):
+        data = list(row('Feldmatt\n\nFeldmatt', 'Scheune\nPVA: 25 kVA'))
+        data[2] = '0366A\n\n0366'
+        entries = services.normalize_row(data)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['insurance_numbers'], ['0366A', '0366'])
+        self.assertEqual(entries[0]['connection_notes'], ['Scheune', 'PVA: 25 kVA'])
+
+    def test_missing_number_remains_missing(self):
+        data = list(row('A\nB\nC', None))
+        data[2] = '01\n\n03'
+        self.assertEqual([e['insurance_numbers'] for e in services.normalize_row(data)], [['01'], [], ['03']])
 
     def test_zero_crlf_nbsp(self):
         self.assertEqual(services.split_positional('\r\nx\xa0y\r\n'), ['', 'x y'])
@@ -71,6 +106,9 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.types = [(Object.__table__.c.geom, Object.__table__.c.geom.type)]
         Object.__table__.c.geom.type = GeometryText()
+        column = Object.__table__.c.insurance_numbers
+        self.types.append((column, column.type))
+        column.type = JSON()
         for name in ('source_outgoing', 'disconnect_point_outgoing', 'connection_notes'):
             column = ServiceConnection.__table__.c[name]
             self.types.append((column, column.type))
@@ -121,6 +159,47 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(connections), 1)
         self.assertEqual(connections[0].source_outgoing, ['5'])
         self.assertEqual(connections[0].connection_notes, [])
+
+    async def test_insurance_numbers_persist_without_becoming_identity(self):
+        data = list(row('Haus 1\n\nHaus 1\nHaus 2', 'Scheune\nPVA: 25 kVA'))
+        data[2] = '0001A\n\n0001\n0001'
+        entries = services.normalize_row(data)
+        for _ in range(2):
+            result = await services.import_service_connections(entries, self.session)
+        buildings = {o.name: o for o in await self.objects() if o.type == 'building'}
+        self.assertEqual(buildings['Haus1'].insurance_numbers, ['0001A', '0001'])
+        self.assertEqual(buildings['Haus2'].insurance_numbers, ['0001'])
+        self.assertIsNone(buildings['Haus1'].ckw_id)
+        self.assertEqual(result['objects']['unchanged'], 2)
+        self.assertEqual(len(await self.connections()), 2)
+        notes = {c.building_id: c.connection_notes for c in await self.connections()}
+        self.assertEqual(notes[buildings['Haus1'].id], ['Scheune', 'PVA: 25 kVA'])
+        # A partial import must not erase other insured structures at the address.
+        entry = {**entries[0], 'insurance_numbers': ['0002']}
+        await services.import_service_connections([entry], self.session)
+        await services.import_service_connections([{**entry, 'insurance_numbers': None}], self.session)
+        self.assertEqual(buildings['Haus1'].insurance_numbers, ['0001A', '0001', '0002'])
+
+    async def test_invalid_positions_skip_before_writing(self):
+        data = list(row('A\n\nB', None))
+        data[2] = '01\n02\n03'
+        result = await services.import_service_connections(services.normalize_row(data), self.session)
+        self.assertEqual(result['skipped'], 2)
+        self.assertEqual(len(await self.objects()), 1)
+        self.assertEqual(await self.connections(), [])
+
+    async def test_singular_insurance_json_and_missing_reference(self):
+        entry = services.normalize_row(row())[0]
+        entry.pop('insurance_numbers')
+        entry['insurance_number'] = '0007B'
+        await services.import_service_connections([entry], self.session)
+        building = next(o for o in await self.objects() if o.type == 'building')
+        self.assertEqual(building.insurance_numbers, ['0007B'])
+        result = await services.import_service_connections([
+            {**entry, 'insurance_number': '0008', 'source_name': 'Missing'}
+        ], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(building.insurance_numbers, ['0007B'])
 
     async def test_municipalities(self):
         for town in ('A', 'B'):
@@ -238,7 +317,9 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         worksheet = workbook.active
         worksheet.title = 'Modified'
         worksheet.append(['Gemeinde', 'Objekt', 'Assek', 'Bemerkung', 'TK', 'Trennstelle', 'Abgang', 'Speisung', 'Abgang'])
-        worksheet.append(row('Haus 1\nHaus 2\nHaus 3', '\n\nLadestation: 11 kVA'))
+        values = list(row('Haus 1\nHaus 2\nHaus 3', '\n\nLadestation: 11 kVA'))
+        values[2] = '0033\n0034\n0035'
+        worksheet.append(values)
         data = BytesIO()
         workbook.save(data)
         workbook.close()
@@ -248,6 +329,8 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['unchanged'], 3)
         self.assertEqual(result['warnings'], [])
         self.assertEqual(len(await self.connections()), 3)
+        self.assertEqual({o.name: o.insurance_numbers for o in await self.objects() if o.type == 'building'},
+                         {'Haus1': ['0033'], 'Haus2': ['0034'], 'Haus3': ['0035']})
 
     async def test_optional_reference_update_preserve_and_clear(self):
         self.session.add_all([Object(name=name, type='distribution_box') for name in ('Box1', 'Box2')])

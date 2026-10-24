@@ -83,7 +83,7 @@ async def _search_addresses_internal(q: str, fields: list[str], limit: int, db: 
     rows = (await db.execute(stmt)).all()
     ranked = sorted(rows, key=lambda row: _rank_score(q, row[0]), reverse=True)[:limit]
 
-    allowed_fields = {"address", "location", "uuid", "lat", "lon", "type"}
+    allowed_fields = {"address", "location", "uuid", "lat", "lon", "type", "insurance_numbers"}
     chosen = [f for f in fields if f in allowed_fields] or ["address", "location", "uuid"]
 
     output = []
@@ -95,6 +95,7 @@ async def _search_addresses_internal(q: str, fields: list[str], limit: int, db: 
             "lat": lat,
             "lon": lon,
             "type": obj.type,
+            "insurance_numbers": obj.insurance_numbers or [],
         }
         output.append({field: candidate[field] for field in chosen})
     return output
@@ -138,6 +139,7 @@ async def get_address_by_uuid(uuid: str, db: AsyncSession = Depends(get_db)):
         "address": _address_value(obj),
         "location": obj.location,
         "type": obj.type,
+        "insurance_numbers": obj.insurance_numbers or [],
         "description": obj.description,
         "lat": lat,
         "lon": lon,
@@ -194,7 +196,7 @@ async def search_connections(
     rows = (await db.execute(stmt)).all()
     ranked = sorted(rows, key=lambda row: _rank_score(q, row[1]), reverse=True)[:limit]
 
-    allowed_fields = {"address", "location", "uuid", "lat", "lon", "type", "connection_uuid"}
+    allowed_fields = {"address", "location", "uuid", "lat", "lon", "type", "connection_uuid", "insurance_numbers"}
     chosen = [f for f in fields if f in allowed_fields] or ["address", "location", "connection_uuid"]
 
     output = []
@@ -207,6 +209,7 @@ async def search_connections(
             "lat": b_lat,
             "lon": b_lon,
             "type": building.type,
+            "insurance_numbers": building.insurance_numbers or [],
         }
         output.append({field: candidate[field] for field in chosen})
 
@@ -271,6 +274,7 @@ async def get_connection_by_uuid(uuid: str, db: AsyncSession = Depends(get_db)):
             "address": _address_value(obj),
             "location": obj.location,
             "type": obj.type,
+            "insurance_numbers": obj.insurance_numbers or [],
             "lat": lat,
             "lon": lon,
         }
@@ -358,6 +362,7 @@ async def nearby_addresses(
             "address": _address_value(obj),
             "location": obj.location,
             "type": obj.type,
+            "insurance_numbers": obj.insurance_numbers or [],
             "lat": row_lat,
             "lon": row_lon,
             "distance_m": float(distance_m) if distance_m is not None else None,

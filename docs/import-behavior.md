@@ -1,8 +1,9 @@
 # Import matching and update rules
 
-The existing Object / ServiceConnection model is unchanged. Notes remain lists
-of strings in JSONB; outgoing values remain arrays. No automatic data cleanup or
-schema migration is performed.
+Objects now have a nullable JSONB `insurance_numbers` array. Notes remain lists
+of strings in JSONB; outgoing values remain arrays. Apply
+`migrations/001_object_insurance_numbers.sql` before deploying to an existing
+database. No automatic data cleanup or schema migration is performed.
 
 ## Causes addressed
 
@@ -73,15 +74,26 @@ Transformer is always required.
 
 ## Excel positions and remaining schema limits
 
-Object, insurance and note cells preserve leading/interior empty positions;
-only trailing empty positions are trimmed. Blank object positions are omitted
-only after assigning corresponding insurance and note positions.
+The Excel endpoint reads the `Modified` worksheet. Object and insurance cells
+are aligned by their original line positions, including empty positions. Each
+nonempty insurance value must have an object at the same position. Otherwise
+all entries from that worksheet row are skipped with an
+`unassigned_insurance_number` warning containing the original number positions.
+Missing numbers remain unknown and do not shift subsequent values.
 
-One object's notes stay together. Up to one note position per object is assigned
-positionally, padding missing trailing notes with empty lists. Only surplus notes
-use the previous fallback: technical notes are replicated; ordinary surplus
-notes are truncated to the object positions. Both overflow cases warn and include
-the original notes in the report, making the legacy ambiguity visible.
+Blank object lines continue the preceding object's notes. Trailing blank layout
+lines are retained as well. A row with one object receives all its notes.
+For multiple objects, an appended `Parallel Strang ...` annotation beyond the
+object lines is treated as a row-wide connection note and reported as
+`row_wide_parallel_note`. Other unassignable notes skip the row with an
+`ambiguous_note_positions` warning containing the original notes. Technical
+notes are no longer broadcast to all addresses, and overflow is not truncated.
+
+Repeated normalized addresses within one worksheet row are combined before
+import. Their insurance numbers and notes are collected in first-seen order,
+removing exact duplicates. The existing address-level model does not distinguish
+individual insured structures or preserve a separate note-to-insurance relation.
+Different source rows retain the existing connection signature rules.
 
 `source_name` retains its existing role. `source_names` carries all Excel source
 names through normalization; the first source is selected because the schema has
@@ -89,11 +101,35 @@ only one transformer foreign key. Multiple sources are reported with all names
 and the selected source. Outgoing arrays remain intact. A later edit to the public
 `source_name` takes precedence over previously normalized source metadata.
 
-Insurance numbers are positionally parsed but not persisted, as before. If later
-required, a nullable **nonunique** `Object.insurance_number` text column is a
-minimal extension (preserving leading zeroes). It must not become a global or
-municipal unique key. Numeric Excel cells cannot recover discarded leading zeroes
-from values alone; source cells should be stored as text.
+`Assek. Nr.` contains building insurance identifiers, not CKW asset IDs.
+They are persisted as `Object.insurance_numbers`, a list of strings preserving
+leading zeroes and letter suffixes. Multiple numbers can belong to one address;
+one number can occur at several addresses, even in one municipality. They are
+therefore neither unique constraints nor object-matching keys. `ckw_id` remains
+separate and unchanged by these values.
+
+JSON connection imports accept `insurance_numbers` or the singular legacy key
+`insurance_number`. Nonempty supplied numbers are added to the building's stored
+list without duplicates. Omitted, null or empty values preserve existing numbers.
+This deliberately supports partial imports; corrections/removals need a separate
+explicit data edit. Numbers are exposed in address/connection detail and nearby
+responses, and through `fields=insurance_numbers` in search responses. They do
+not currently participate in free-text search. Numeric Excel cells cannot recover
+leading zeroes already lost from the underlying value; identifier cells should
+remain text.
+
+### Source workbook audit (2026-10-24)
+
+Read-only analysis of `260317 FRS gesamt Liste.xlsx`, worksheet `Modified`:
+2,770 data rows, 4,317 nonempty object/number positions, 779 rows with multiple
+objects, and 85 rows with interior layout blanks carrying continuation notes.
+There are 374 normalized municipality/address pairs with multiple distinct
+insurance numbers. All nonempty object and number positions align in this file.
+The new parser produces 3,917 address entries after within-row grouping and
+4,313 insurance values after exact duplicate removal. No row is rejected and no
+distinct source note or number is lost. Row-wide parallel annotations generate
+68 warnings across the normalized entries. These parser checks do not establish
+that every referenced grid object exists in the deployed database.
 
 ## Transactions and API reports
 

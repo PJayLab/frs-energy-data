@@ -21,42 +21,69 @@ async def create_tables():
         await conn.run_sync(ServiceConnection.metadata.create_all)
 
 
-TECH_HINTS = ['PVA', 'kVA', 'Ladestation']
 split_cell = split_compact
 split_and_clean = split_compact
 
 
-def is_technical(texts):
-    return any(hint in ' '.join(texts) for hint in TECH_HINTS)
-
-
 def assign_notes(objects, notes):
-    """Position first; retain overflow heuristics for inconsistent sheets."""
-    if len(objects) == 1:
-        return [split_compact(notes)], []
-    if len(notes) <= len(objects):
-        return [[notes[i]] if i < len(notes) and notes[i] else [] for i in range(len(objects))], []
-    warning = dict(field='connection_notes', reason='ambiguous_note_positions', values=notes)
-    if is_technical(notes):
-        return [split_compact(notes) for _ in objects], [warning]
-    return [[notes[i]] if notes[i] else [] for i in range(len(objects))], [warning]
+    """Blank object lines continue the preceding object's note block."""
+    assigned = [[] for _ in objects]
+    positions = [i for i, name in enumerate(objects) if name]
+    if len(positions) == 1:
+        assigned[positions[0]] = split_compact(notes)
+        return assigned, []
+    previous = None
+    warnings = []
+    for i, note in enumerate(notes):
+        if i < len(objects) and objects[i]:
+            previous = i
+        if not note:
+            continue
+        if i < len(objects) and previous is not None:
+            assigned[previous].append(note)
+        elif i >= len(objects) and note.startswith('Parallel Strang '):
+            for position in positions:
+                assigned[position].append(note)
+            warnings.append(dict(field='connection_notes', reason='row_wide_parallel_note', values=[note]))
+        else:
+            warnings.append(dict(field='connection_notes', reason='ambiguous_note_positions', values=notes))
+    return assigned, warnings
 
 
 def normalize_row(row):
     row = list(row) + [None] * max(0, 9 - len(row))
-    objects = split_positional(row[1])
+    # Retain trailing layout lines, which may hold notes for the last object.
+    objects = [line.strip() for line in str(row[1] or '').replace('\xa0', ' ').replace('\r\n', '\n').replace('\r', '\n').split('\n')]
     insurance = split_positional(row[2])
     notes, warnings = assign_notes(objects, split_positional(row[3]))
+    if any(number and (i >= len(objects) or not objects[i]) for i, number in enumerate(insurance)):
+        warnings.append(dict(field='insurance_numbers', reason='unassigned_insurance_number', values=insurance))
+    invalid = any(w['reason'] in ('ambiguous_note_positions', 'unassigned_insurance_number') for w in warnings)
     sources = split_compact(row[7])
-    return [dict(
+    entries = [dict(
         municipality=clean_text(row[0]), object=name,
         insurance_number=insurance[i] if i < len(insurance) else None,
+        insurance_numbers=[insurance[i]] if i < len(insurance) and insurance[i] else [],
         connection_notes=notes[i], unswitched_terminal=clean_text(row[4]),
         first_disconnect_point=clean_text(row[5]),
         disconnect_point_outgoing=split_compact(row[6]),
         source_name=sources[0] if sources else None, source_names=sources,
-        source_outgoing=split_compact(row[8]), _warnings=warnings,
+        source_outgoing=split_compact(row[8]), _warnings=warnings, _skip_import=invalid,
     ) for i, name in enumerate(objects) if name]
+    # Several insured structures can share an address and connection.
+    grouped = {}
+    for entry in entries:
+        key = normalize_object_name(entry['object'])
+        if key not in grouped:
+            grouped[key] = entry
+        else:
+            target = grouped[key]
+            for field in ('insurance_numbers', 'connection_notes'):
+                target[field] = list(dict.fromkeys(target[field] + entry[field]))
+            target['insurance_number'] = target['insurance_numbers'][0] if len(target['insurance_numbers']) == 1 else None
+    if not grouped and any(clean_text(value) for value in row):
+        return [dict(object=None, _warnings=warnings + [dict(field='building', reason='empty_object_name')], _skip_import=True)]
+    return list(grouped.values())
 
 
 def entry_value(entry, key, alias=None):
@@ -79,6 +106,9 @@ async def _import_connections(raw_entries, session, objects, report):
         display = clean_text(entry.get('object') or entry.get('objekt'))
         context = dict(object=display, row=entry.get('_excel_row', row_number))
         report['warnings'].extend({**w, **context} for w in entry.get('_warnings', []))
+        if entry.get('_skip_import'):
+            report['skipped'] += 1
+            continue
         if not display:
             report['warnings'].append(dict(**context, field='building', reason='empty_object_name'))
             report['skipped'] += 1
@@ -124,6 +154,14 @@ async def _import_connections(raw_entries, session, objects, report):
             report['skipped'] += 1
             continue
         report['objects'][status] += 1
+        numbers = split_compact(entry_value(entry, 'insurance_numbers', 'insurance_number'))
+        if numbers:
+            combined = list(dict.fromkeys((building.insurance_numbers or []) + numbers))
+            if combined != building.insurance_numbers:
+                building.insurance_numbers = combined
+                if status == 'unchanged':
+                    report['objects']['unchanged'] -= 1
+                    report['objects']['updated'] += 1
         values = dict(building_id=building.id, **references)
         for field, alias in (('source_outgoing', 'abgang_speisung'), ('disconnect_point_outgoing', 'abgang_trennstelle'), ('connection_notes', 'bemerkungen')):
             value = entry_value(entry, field, alias)
@@ -198,6 +236,8 @@ async def import_to_db(import_data: ImportData):
             # raw_entries retain municipality and missing-vs-empty semantics that
             # the historical validator's name-only object map would discard.
             for entry in import_data.raw_entries:
+                if entry.get('_skip_import'):
+                    continue
                 for field, alias, obj_type in (
                     ('unswitched_terminal', 'tk_ohne_schalt', ObjectType.disconnect_point),
                     ('first_disconnect_point', 'erste_trennstelle', ObjectType.distribution_box),
