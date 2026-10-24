@@ -7,6 +7,7 @@ from geoalchemy2 import WKTElement
 from app.database import AsyncSessionLocal, engine
 from app.models import Object, ServiceConnection, ObjectType
 from app.schemas import ImportData, GPSImportData
+from app.connection_sync import replace_building_connections
 from app.import_helpers import (
     AmbiguousMatch, clean_text, normalize_object_name, split_positional,
     split_compact, normalize_array_for_comparison, find_existing_object,
@@ -101,23 +102,42 @@ def source_values(entry):
     return sources if sources and (not primary or primary[0] == sources[0]) else primary
 
 
-async def _import_connections(raw_entries, session, objects, report):
+async def _import_connections(raw_entries, session, objects, report, *, replace_existing=False):
     prepared = defaultdict(list)
+    blocked = set()
+    buildings = {}
+    insurance_by_building = defaultdict(list)
+    object_statuses = defaultdict(list)
+    name_locations = defaultdict(set)
+    for entry in raw_entries:
+        name_locations[normalize_object_name(entry.get('object') or entry.get('objekt'))].add(
+            clean_text(entry.get('municipality') or entry.get('gemeinde')))
     for row_number, entry in enumerate(raw_entries, 1):
         display = clean_text(entry.get('object') or entry.get('objekt'))
-        context = dict(object=display, row=entry.get('_excel_row', row_number))
+        location = clean_text(entry.get('municipality') or entry.get('gemeinde'))
+        scope = (location, normalize_object_name(display))
+        context = dict(object=display, location=location, row=entry.get('_excel_row', row_number))
         report['warnings'].extend({**w, **context} for w in entry.get('_warnings', []))
         if entry.get('_skip_import'):
+            blocked.add(scope)
             report['skipped'] += 1
             continue
         if not display:
             report['warnings'].append(dict(**context, field='building', reason='empty_object_name'))
             report['skipped'] += 1
             continue
-        location = clean_text(entry.get('municipality') or entry.get('gemeinde'))
+        if not location:
+            report['warnings'].append(dict(**context, field='building', reason='missing_municipality'))
+            report['skipped'] += 1
+            blocked.add(scope)
+            continue
         sources = unique_reference_names(source_values(entry))
         if len(sources) > 1:
             report['warnings'].append(dict(**context, field='transformer', reason='multiple_sources_single_transformer', values=sources, selected=sources[0]))
+            if replace_existing:
+                blocked.add(scope)
+                report['skipped'] += 1
+                continue
         references = {}
         failed = False
         for field, name in (
@@ -134,7 +154,7 @@ async def _import_connections(raw_entries, session, objects, report):
                 continue
             name = names[0] if names else None
             if not name and field != 'transformer':
-                if explicit_clear:
+                if explicit_clear or replace_existing:
                     references[field + '_id'] = None
                 continue
             try:
@@ -151,18 +171,25 @@ async def _import_connections(raw_entries, session, objects, report):
                 report['warnings'].append(dict(**context, field=field, missing_reference=name, reason=reason))
                 failed = True
         if failed:
+            blocked.add(scope)
             # An unresolved explicit reference must not partially change a connection.
             report['skipped'] += 1
             continue
         try:
-            building, status = await upsert_object(session, objects, name=display, location=location, ckw_id=entry.get('ckw_id'), type=ObjectType.building)
+            building, status = await upsert_object(session, objects, name=display, location=location,
+                ckw_id=entry.get('ckw_id'), type=ObjectType.building,
+                allow_locationless=not replace_existing and len(name_locations[scope[1]]) == 1)
         except AmbiguousMatch as exc:
+            blocked.add(scope)
             report['warnings'].append(dict(**context, field='building', reason='ambiguous_object', detail=str(exc)))
             report['skipped'] += 1
             continue
         report['objects'][status] += 1
+        object_statuses[building.id].append(status)
         numbers = split_compact(entry_value(entry, 'insurance_numbers', 'insurance_number'))
-        if numbers:
+        buildings[building.id] = building
+        insurance_by_building[building.id].extend(numbers)
+        if numbers and not replace_existing:
             combined = list(dict.fromkeys((building.insurance_numbers or []) + numbers))
             if combined != building.insurance_numbers:
                 building.insurance_numbers = combined
@@ -182,6 +209,22 @@ async def _import_connections(raw_entries, session, objects, report):
 
     for building_id, rows in prepared.items():
         candidates = list((await session.scalars(select(ServiceConnection).where(ServiceConnection.building_id == building_id))).all())
+        if replace_existing:
+            building = buildings[building_id]
+            if (clean_text(building.location), normalize_object_name(building.name)) in blocked:
+                report['warnings'].append(dict(object=building.friendly_name or building.name,
+                    location=building.location, field='connection', reason='replacement_blocked_by_incomplete_building'))
+                report['skipped'] += len(rows)
+                continue
+            success = await replace_building_connections(session, building, rows, candidates, report)
+            if success:
+                numbers = list(dict.fromkeys(insurance_by_building[building_id]))
+                if building.insurance_numbers != numbers:
+                    building.insurance_numbers = numbers
+                    if all(s == 'unchanged' for s in object_statuses[building_id]):
+                        report['objects']['unchanged'] -= 1
+                        report['objects']['updated'] += 1
+            continue
         signatures = {build_connection_signature(values) for values, _ in rows}
         seen = set()
         for values, context in rows:
@@ -202,10 +245,23 @@ async def _import_connections(raw_entries, session, objects, report):
             report['imported'].append(connection)
 
 
-async def import_service_connections(raw_entries: list[dict], session: AsyncSession):
+async def import_service_connections(raw_entries: list[dict], session: AsyncSession, *,
+                                     replace_existing=False, dry_run=False):
+    if replace_existing:
+        required = ('unswitched_terminal', 'first_disconnect_point', 'source_outgoing',
+                    'disconnect_point_outgoing', 'connection_notes', 'insurance_numbers')
+        if not raw_entries or any(
+            not clean_text(e.get('municipality')) or not clean_text(e.get('object')) or
+            any(key not in e for key in required) or
+            any(not isinstance(e[key], list) or any(v is None for v in e[key])
+                for key in required[2:]) for e in raw_entries):
+            raise ValueError('Replacement requires complete Excel rows with municipality, object and all connection fields')
     report = new_report()
-    async with import_transaction(session):
-        await _import_connections(raw_entries, session, await load_objects(session), report)
+    report.update(dry_run=dry_run, mode='replace_buildings' if replace_existing else 'merge',
+                  deleted=0, consolidated=0, removed_connections=[])
+    async with import_transaction(session, dry_run=dry_run):
+        await _import_connections(raw_entries, session, await load_objects(session), report,
+                                  replace_existing=replace_existing)
     return report
 
 

@@ -82,7 +82,7 @@ class ObjectIndex(list):
 
 
 @asynccontextmanager
-async def import_transaction(session):
+async def import_transaction(session, *, dry_run=False):
     """Own one commit/rollback, including an existing authentication read.
 
     Serialize imports on PostgreSQL to prevent concurrent check/insert races.
@@ -92,7 +92,10 @@ async def import_transaction(session):
         if session.get_bind().dialect.name == 'postgresql':
             await session.execute(text('SELECT pg_advisory_xact_lock(724183901)'))
         yield
-        await session.commit()
+        if dry_run:
+            await session.rollback()
+        else:
+            await session.commit()
     except BaseException:
         await session.rollback()
         raise
@@ -104,17 +107,26 @@ def _unique(candidates, identity):
     return candidates[0] if candidates else None
 
 
-def find_existing_object(objects, name, location=None, ckw_id=None):
+def find_existing_object(objects, name, location=None, ckw_id=None, *, expected_type=None,
+                         allow_locationless=True, exclude_buildings=False):
     location, ckw_id = clean_text(location), clean_text(ckw_id)
     if ckw_id:
         assets = objects.assets[ckw_id] if isinstance(objects, ObjectIndex) else [o for o in objects if clean_text(o.ckw_id) == ckw_id]
         found = _unique(assets, f'ckw_id={ckw_id}')
         if found:
+            if expected_type and found.type != expected_type:
+                raise AmbiguousMatch(f'Conflicting object type for ckw_id={ckw_id}')
+            if expected_type == 'building' and location and clean_text(found.location) not in (None, location):
+                raise AmbiguousMatch(f'Conflicting municipality for ckw_id={ckw_id}')
             return found
     candidates = objects.names[normalize_object_name(name)] if isinstance(objects, ObjectIndex) else [o for o in objects if normalize_object_name(o.name) == normalize_object_name(name)]
+    if expected_type:
+        candidates = [o for o in candidates if o.type == expected_type]
+    if exclude_buildings:
+        candidates = [o for o in candidates if o.type != 'building']
     if location:
         exact = [o for o in candidates if clean_text(o.location) == location]
-        candidates = exact or [o for o in candidates if not clean_text(o.location)]
+        candidates = exact or ([o for o in candidates if not clean_text(o.location)] if allow_locationless else [])
     found = _unique(candidates, f'name={name}, location={location}')
     if found and ckw_id and clean_text(found.ckw_id) not in (None, ckw_id):
         raise AmbiguousMatch(f'Conflicting asset IDs for {name}')
@@ -123,19 +135,20 @@ def find_existing_object(objects, name, location=None, ckw_id=None):
 
 def find_reference_object(objects, name, location=None):
     # Preserve exact matching and its ambiguity checks before trying aliases.
-    found = find_existing_object(objects, name, location)
+    found = find_existing_object(objects, name, location, exclude_buildings=True)
     if found:
         return found, False
     key = reference_name_key(name)
     candidates = (objects.reference_names[key] if isinstance(objects, ObjectIndex)
                   else [o for o in objects if reference_name_key(o.name) == key])
+    candidates = [o for o in candidates if o.type != 'building']
     if location:
         local = [o for o in candidates if reference_name_key(o.location) == reference_name_key(location)]
         unknown = [o for o in candidates if not clean_text(o.location)]
         if local or unknown:
             return _unique(local or unknown, f'reference={name}, location={location}'), True
     # An exact global name is preferred over a global alias (cross-border assets).
-    found = find_existing_object(objects, name)
+    found = find_existing_object(objects, name, exclude_buildings=True)
     if found:
         return found, False
     return _unique(candidates, f'reference={name}'), True
@@ -151,7 +164,9 @@ async def upsert_object(session, objects, *, name, location=None, ckw_id=None, *
     display = clean_text(name)
     if not display:
         raise AmbiguousMatch('Empty object name')
-    existing = find_existing_object(objects, display, location, ckw_id)
+    allow_locationless = attributes.pop('allow_locationless', True)
+    existing = find_existing_object(objects, display, location, ckw_id,
+        expected_type=attributes.get('type'), allow_locationless=allow_locationless)
     values = dict(name=normalize_object_name(display), location=clean_text(location), ckw_id=clean_text(ckw_id), **attributes)
     # Compact GPS names must not destroy a previously formatted display name.
     if not existing or not existing.friendly_name or normalize_object_name(existing.friendly_name) != values['name'] or display != values['name']:

@@ -13,12 +13,12 @@ from sqlalchemy import JSON, Text, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.types import TypeDecorator
 
-from app.models import Object, ServiceConnection
+from app.models import Object, ServiceConnection, ConnectionIssueReport
 from app.schemas import GPSImportData, ImportData
 from app import services
 from app.api.import_router import import_excel, import_response
 from app.import_helpers import ObjectIndex, find_reference_object, upsert_object
-from fastapi import UploadFile
+from fastapi import UploadFile, HTTPException
 from openpyxl import Workbook
 
 
@@ -126,6 +126,7 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as conn:
             await conn.run_sync(lambda c: Object.__table__.create(c))
             await conn.run_sync(lambda c: ServiceConnection.__table__.create(c))
+            await conn.run_sync(lambda c: ConnectionIssueReport.__table__.create(c))
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.session = self.sessions()
         self.session.add(Object(name='TransformerA', friendly_name='Transformer A', type='transformer'))
@@ -142,6 +143,182 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
 
     async def connections(self):
         return list((await self.session.scalars(select(ServiceConnection))).all())
+
+    async def seed_wrong_municipality_connections(self):
+        geu = Object(name='Bahnhofplatz6', location='Geuensee', type='building', insurance_numbers=['0103B', '0208'])
+        sur = Object(name='Bahnhofplatz6', location='Sursee', type='building')
+        geu_ts = Object(name='GEU-Allmend', type='transformer')
+        sur_ts = Object(name='SUR-Fruchthof', type='transformer')
+        box = Object(name='Hinterdorfstrasse16', type='distribution_box', location='Geuensee')
+        self.session.add_all([geu, sur, geu_ts, sur_ts, box])
+        await self.session.flush()
+        correct = ServiceConnection(building_id=geu.id, transformer_id=geu_ts.id, distribution_box_id=box.id,
+            source_outgoing=['4'], disconnect_point_outgoing=['5'], connection_notes=[])
+        stale = [ServiceConnection(building_id=geu.id, transformer_id=sur_ts.id, distribution_box_id=sur_ts.id,
+            source_outgoing=['2'], disconnect_point_outgoing=['2'], connection_notes=notes)
+            for notes in (['Stationsgebäude'], ['Verkaufsstand'], [])]
+        self.session.add_all([correct, *stale])
+        await self.session.commit()
+        entries = services.normalize_row(('Geuensee', 'Bahnhofplatz 6', '0103B', None,
+            None, 'Hinterdorfstrasse 16', '5', 'GEU-Allmend', '4'))
+        entries += services.normalize_row(('Sursee', 'Bahnhofplatz 6\nBahnhofplatz 6\nBahnhofplatz 6',
+            '0208\n9886\n0208C', 'Stationsgebäude\nVerkaufsstand', None, 'SUR-Fruchthof', '2', 'SUR-Fruchthof', '2'))
+        return geu.id, sur.id, correct.id, [c.id for c in stale], entries
+
+    async def test_replace_repairs_bahnhofplatz_and_is_idempotent(self):
+        geu_id, sur_id, correct_id, stale_ids, entries = await self.seed_wrong_municipality_connections()
+        result = await services.import_service_connections(entries, self.session, replace_existing=True)
+        self.assertEqual(result['deleted'], 3)
+        self.assertEqual({c['id'] for c in result['removed_connections']}, set(stale_ids))
+        connections = await self.connections()
+        self.assertEqual(len(connections), 2)
+        geu = next(c for c in connections if c.building_id == geu_id)
+        sur = next(c for c in connections if c.building_id == sur_id)
+        self.assertEqual(geu.id, correct_id)
+        self.assertEqual(geu.connection_notes, [])
+        self.assertEqual(sur.connection_notes, ['Stationsgebäude', 'Verkaufsstand'])
+        self.assertEqual((await self.session.get(Object, geu_id)).insurance_numbers, ['0103B'])
+        self.assertEqual((await self.session.get(Object, sur_id)).insurance_numbers, ['0208', '9886', '0208C'])
+        ids = {c.id for c in connections}
+        again = await services.import_service_connections(entries, self.session, replace_existing=True)
+        self.assertEqual((again['created'], again['updated'], again['deleted']), (0, 0, 0))
+        self.assertEqual({c.id for c in await self.connections()}, ids)
+
+    async def test_replace_preview_rolls_back_everything(self):
+        geu_id, sur_id, correct_id, stale_ids, entries = await self.seed_wrong_municipality_connections()
+        result = await services.import_service_connections(entries, self.session, replace_existing=True, dry_run=True)
+        self.assertEqual(result['deleted'], 3)
+        self.assertEqual(import_response(result)['status'], 'preview')
+        self.assertEqual({c.id for c in await self.connections()}, {correct_id, *stale_ids})
+        self.assertEqual((await self.session.get(Object, geu_id)).insurance_numbers, ['0103B', '0208'])
+        self.assertIsNone((await self.session.get(Object, sur_id)).insurance_numbers)
+
+    async def test_replace_unresolved_row_protects_entire_building(self):
+        geu_id, _, correct_id, stale_ids, entries = await self.seed_wrong_municipality_connections()
+        bad = {**entries[0], 'source_name': 'Missing', 'source_names': []}
+        result = await services.import_service_connections([entries[0], bad], self.session, replace_existing=True)
+        self.assertEqual(result['deleted'], 0)
+        self.assertEqual(result['skipped'], 2)
+        self.assertEqual({c.id for c in await self.connections()}, {correct_id, *stale_ids})
+        self.assertEqual((await self.session.get(Object, geu_id)).insurance_numbers, ['0103B', '0208'])
+
+    async def test_replace_does_not_touch_other_municipality_or_unlisted_buildings(self):
+        _, sur_id, correct_id, _, entries = await self.seed_wrong_municipality_connections()
+        await services.import_service_connections(entries, self.session, replace_existing=True)
+        before = next(c for c in await self.connections() if c.building_id == sur_id)
+        sur_connection_id = before.id
+        await services.import_service_connections([entries[0]], self.session, replace_existing=True)
+        self.assertEqual({c.id for c in await self.connections()}, {correct_id, sur_connection_id})
+
+    async def test_replace_issue_report_blocks_stale_connection_deletion(self):
+        _, _, correct_id, stale_ids, entries = await self.seed_wrong_municipality_connections()
+        issue = ConnectionIssueReport(connection_id=stale_ids[0], user='test', remarks='Review')
+        self.session.add(issue)
+        await self.session.commit()
+        result = await services.import_service_connections([entries[0]], self.session, replace_existing=True)
+        self.assertEqual(result['deleted'], 0)
+        self.assertEqual(result['warnings'][-1]['reason'], 'replacement_blocked_by_issue_reports')
+        self.assertEqual({c.id for c in await self.connections()}, {correct_id, *stale_ids})
+
+    async def test_replace_collapses_duplicates_and_combines_source_row_notes(self):
+        entry = services.normalize_row(row())[0]
+        await services.import_service_connections([entry], self.session)
+        original = (await self.connections())[0]
+        self.session.add(ServiceConnection(building_id=original.building_id, transformer_id=original.transformer_id,
+            source_outgoing=['4'], disconnect_point_outgoing=[], connection_notes=['Old']))
+        await self.session.commit()
+        result = await services.import_service_connections([entry, {**entry, 'connection_notes': ['Additional']}],
+            self.session, replace_existing=True)
+        self.assertEqual(result['deleted'], 1)
+        self.assertEqual(result['consolidated'], 1)
+        self.assertEqual(len(await self.connections()), 1)
+        self.assertEqual((await self.connections())[0].connection_notes, ['PVA: 30 kVA', 'Additional'])
+
+    async def test_replace_clears_blank_optional_reference(self):
+        geu_id, _, correct_id, _, entries = await self.seed_wrong_municipality_connections()
+        entry = {**entries[0], 'first_disconnect_point': None}
+        await services.import_service_connections([entry], self.session, replace_existing=True)
+        connection = next(c for c in await self.connections() if c.building_id == geu_id)
+        self.assertIsNone(connection.distribution_box_id)
+        self.assertNotEqual(connection.id, correct_id)  # A changed path receives a new identity.
+
+    async def test_replace_rejects_incomplete_payload_and_multiple_sources(self):
+        entry = services.normalize_row(row())[0]
+        for invalid in [{**entry, 'municipality': None}, {k: v for k, v in entry.items() if k != 'source_outgoing'}]:
+            with self.assertRaises(ValueError):
+                await services.import_service_connections([invalid], self.session, replace_existing=True)
+        entry['source_name'] = 'Transformer A\nTransformer B'
+        result = await services.import_service_connections([entry], self.session, replace_existing=True)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(await self.connections(), [])
+
+    async def test_replace_failure_rolls_back_deletes(self):
+        _, _, correct_id, stale_ids, entries = await self.seed_wrong_municipality_connections()
+        with patch.object(self.session, 'commit', side_effect=RuntimeError('commit failed')):
+            with self.assertRaises(RuntimeError):
+                await services.import_service_connections(entries, self.session, replace_existing=True)
+        self.assertEqual({c.id for c in await self.connections()}, {correct_id, *stale_ids})
+
+    async def test_excel_replace_preview_then_apply(self):
+        _, _, correct_id, stale_ids, _ = await self.seed_wrong_municipality_connections()
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = 'Modified'
+        sheet.append(['Gemeinde', 'Objekt', 'Assek. Nr.', 'Bemerkungen/Verbindung',
+            'TK ohne Schaltmöglichkeit', 'Erste Trennstelle', 'Abgang Trennstelle', 'Speisung', 'Abgang Speisung'])
+        sheet.append(['Geuensee', 'Bahnhofplatz 6', '0103B', None, None, 'Hinterdorfstrasse 16', '5', 'GEU-Allmend', '4'])
+        data = BytesIO()
+        workbook.save(data)
+        workbook.close()
+        for preview in (True, False):
+            result = await import_excel(UploadFile(file=BytesIO(data.getvalue()), filename='test.xlsx'),
+                self.session, mode='replace_buildings', dry_run=preview)
+            self.assertEqual(result['deleted'], 3)
+            self.assertEqual(result['status'], 'preview' if preview else 'success')
+            self.assertEqual({c.id for c in await self.connections()}, {correct_id, *stale_ids} if preview else {correct_id})
+
+    async def test_excel_replace_rejects_unrecognized_columns(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = 'Modified'
+        sheet.append(['Wrong layout'])
+        data = BytesIO()
+        workbook.save(data)
+        workbook.close()
+        with self.assertRaises(HTTPException) as raised:
+            await import_excel(UploadFile(file=BytesIO(data.getvalue()), filename='test.xlsx'),
+                self.session, mode='replace_buildings')
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_building_and_grid_asset_with_same_name_remain_separate(self):
+        box = Object(name='Haus1', location='A', type='distribution_box')
+        self.session.add(box)
+        await self.session.commit()
+        entry = services.normalize_row(row('Haus 1'))[0]
+        entry['first_disconnect_point'] = 'Haus 1'
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['created'], 1)
+        connection = (await self.connections())[0]
+        self.assertNotEqual(connection.building_id, box.id)
+        self.assertEqual(connection.distribution_box_id, box.id)
+        self.assertEqual(box.type, 'distribution_box')
+
+    async def test_building_asset_id_cannot_move_between_municipalities(self):
+        self.session.add(Object(name='Haus1', location='A', ckw_id='same', type='building'))
+        await self.session.commit()
+        entry = services.normalize_row(row('Haus 1', municipality='B'))[0]
+        result = await services.import_service_connections([{**entry, 'ckw_id': 'same'}], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(next(o for o in await self.objects() if o.ckw_id == 'same').location, 'A')
+
+    async def test_unknown_location_not_adopted_across_two_municipalities(self):
+        historical = Object(name='Haus1', type='building')
+        self.session.add(historical)
+        await self.session.commit()
+        entries = services.normalize_row(row('Haus 1', municipality='A')) + services.normalize_row(row('Haus 1', municipality='B'))
+        await services.import_service_connections(entries, self.session)
+        self.assertIsNone(historical.location)
+        self.assertEqual({o.location for o in await self.objects() if o.type == 'building'}, {None, 'A', 'B'})
 
     async def test_reimport_and_display_name(self):
         entries = services.normalize_row(row())
