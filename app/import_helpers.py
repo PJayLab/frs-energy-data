@@ -133,22 +133,22 @@ def find_existing_object(objects, name, location=None, ckw_id=None, *, expected_
     return found
 
 
-def find_reference_object(objects, name, location=None):
+def find_reference_object(objects, name, location=None, *, expected_type=None):
     # Preserve exact matching and its ambiguity checks before trying aliases.
-    found = find_existing_object(objects, name, location, exclude_buildings=True)
+    found = find_existing_object(objects, name, location, exclude_buildings=True, expected_type=expected_type)
     if found:
         return found, False
     key = reference_name_key(name)
     candidates = (objects.reference_names[key] if isinstance(objects, ObjectIndex)
                   else [o for o in objects if reference_name_key(o.name) == key])
-    candidates = [o for o in candidates if o.type != 'building']
+    candidates = [o for o in candidates if o.type != 'building' and (not expected_type or o.type == expected_type)]
     if location:
         local = [o for o in candidates if reference_name_key(o.location) == reference_name_key(location)]
         unknown = [o for o in candidates if not clean_text(o.location)]
         if local or unknown:
             return _unique(local or unknown, f'reference={name}, location={location}'), True
     # An exact global name is preferred over a global alias (cross-border assets).
-    found = find_existing_object(objects, name, exclude_buildings=True)
+    found = find_existing_object(objects, name, exclude_buildings=True, expected_type=expected_type)
     if found:
         return found, False
     return _unique(candidates, f'reference={name}'), True

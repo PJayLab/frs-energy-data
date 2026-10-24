@@ -94,3 +94,54 @@ uvicorn main:app --reload
 - Run import regressions with `python -m unittest discover -s tests -v`.
   Set `TEST_POSTGRES_URL` only for a dedicated PostGIS test database to run
   the optional PostgreSQL integration suite.
+
+## Recommended import order and historical repair
+
+1. Import authoritative CKW infrastructure with `POST /import/gps` and a JSON
+   body `{"points": [...]}`. Supply `ckw_id` and an explicit type: `transformer`,
+   `distribution_box`, or `disconnect_point`.
+2. Import the Excel connection lists. Buildings are separate objects, even when
+   their address equals a grid object's name (for example Schlottermilch 10).
+   Each network reference must match its column's type. Missing or ambiguous
+   references skip the row and appear in the import warnings.
+3. Let the external geocoding application fill coordinates only for objects with
+   `type = 'building'` and missing geometry, using the building UUID to update
+   the intended record. Do not identify an update by address alone. This repository
+   does not modify that external application's behavior.
+
+For historical CKW objects incorrectly typed as buildings, back up the database
+and first submit the authoritative GPS file to:
+
+`POST /import/gps?repair_buildings=true&dry_run=true`
+
+Review `repairs`, `skipped`, and `warnings`. The preview rolls back all writes.
+Apply the same file with `POST /import/gps?repair_buildings=true`.
+This explicit repair requires a unique matching CKW ID and an explicit grid type.
+It retains the infrastructure UUID, CKW ID and network references, restores its
+GPS type, and moves building connections to a separate building. A unique existing
+building at the same normalized address and location is reused; otherwise one is
+created. Insurance numbers move to the building. Newly created buildings have no
+coordinates or CKW ID; existing building coordinates are preserved. Connection
+UUIDs and issue-report links remain intact. Conflicting network roles or ambiguous
+replacement buildings are skipped for review. Repeating the repaired import does
+not create another building.
+
+Normal GPS imports still reject type conflicts. Both normal and repair GPS imports
+support `dry_run=true`. After repair, reimport the connection lists to resolve
+previously missing references and review all warnings. Do not clear the database
+or revert the import code to recover these objects.
+
+## Nearby type filter
+
+`GET /search/nearby` accepts an optional repeated `types` query parameter:
+
+```text
+/search/nearby?lat=47.13&lon=8.00&radius=500&types=distribution_box&types=disconnect_point
+```
+
+Allowed values are `building`, `transformer`, `distribution_box`, and
+`disconnect_point`. Omit `types` to include all four types. Unknown values return
+HTTP 422. Filtering happens in the database before the nearest-result limit
+(default 100, maximum 500). Each result includes its `type`. Objects without
+coordinates cannot appear in a radius search. Disconnect points were already
+eligible for unfiltered nearby searches; no type was previously excluded.

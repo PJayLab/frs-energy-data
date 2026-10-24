@@ -75,11 +75,13 @@ async def import_service_connections_endpoint(payload: list[dict], db: AsyncSess
 
 
 @router.post("/gps")
-async def import_gps(payload: GPSImportData, db: AsyncSession = Depends(get_db)):
+async def import_gps(payload: GPSImportData, db: AsyncSession = Depends(get_db),
+                     repair_buildings: bool = False, dry_run: bool = False):
     if not payload.points:
         raise HTTPException(status_code=400, detail="Empty payload")
 
-    result = await import_gps_objects(payload, db, return_report=True)
+    result = await import_gps_objects(payload, db, return_report=True,
+        repair_buildings=repair_buildings, dry_run=dry_run)
     return {**import_response(result), "imported": len(result["imported"])}
 
 

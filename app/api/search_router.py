@@ -329,6 +329,7 @@ async def nearby_addresses(
     lon: float,
     radius: int = Query(default=500, ge=1, le=50000),
     limit: int = Query(default=100, ge=1, le=500),
+    types: list[ObjectType] | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     point_wkt = f"SRID=4326;POINT({lon} {lat})"
@@ -340,8 +341,8 @@ async def nearby_addresses(
     stmt = (
         select(
             Object,
-            Object.geom.ST_X().label("lon"),
-            Object.geom.ST_Y().label("lat"),
+            func.ST_X(Object.geom).label("lon"),
+            func.ST_Y(Object.geom).label("lat"),
             distance_expr.label("distance_m"),
         )
         .where(
@@ -354,6 +355,9 @@ async def nearby_addresses(
         .order_by(distance_expr.asc())
         .limit(limit)
     )
+
+    if types:
+        stmt = stmt.where(Object.type.in_(types))
 
     rows = (await db.execute(stmt)).all()
     return [

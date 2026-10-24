@@ -150,7 +150,9 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         geu_ts = Object(name='GEU-Allmend', type='transformer')
         sur_ts = Object(name='SUR-Fruchthof', type='transformer')
         box = Object(name='Hinterdorfstrasse16', type='distribution_box', location='Geuensee')
-        self.session.add_all([geu, sur, geu_ts, sur_ts, box])
+        # Same-name grid roles are distinct under typed reference matching.
+        sur_box = Object(name='SUR-Fruchthof', type='distribution_box')
+        self.session.add_all([geu, sur, geu_ts, sur_ts, box, sur_box])
         await self.session.flush()
         correct = ServiceConnection(building_id=geu.id, transformer_id=geu_ts.id, distribution_box_id=box.id,
             source_outgoing=['4'], disconnect_point_outgoing=['5'], connection_notes=[])
@@ -289,6 +291,80 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
             await import_excel(UploadFile(file=BytesIO(data.getvalue()), filename='test.xlsx'),
                 self.session, mode='replace_buildings')
         self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_gps_repair_splits_building_and_is_repeatable(self):
+        asset = Object(name='Schlottermilch10', location='A', type='building',
+                       ckw_id='KAK10', insurance_numbers=['001'])
+        self.session.add(asset)
+        await self.session.flush()
+        transformer = next(o for o in await self.objects() if o.type == 'transformer')
+        connection = ServiceConnection(building_id=asset.id, transformer_id=transformer.id,
+                                       distribution_box_id=asset.id)
+        self.session.add(connection)
+        await self.session.commit()
+        original_id, connection_id = asset.id, connection.id
+        payload = GPSImportData(points=[dict(name='Schlottermilch10', ckw_id='KAK10',
+            type='distribution_box', lat=47, lon=8)])
+        preview = await services.import_gps_objects(payload, self.session,
+            return_report=True, repair_buildings=True, dry_run=True)
+        self.assertEqual(len(preview['repairs']), 1)
+        self.assertEqual(len(await self.objects()), 2)
+        asset = await self.session.get(Object, original_id)
+        self.assertEqual(asset.type, 'building')
+        result = await services.import_gps_objects(payload, self.session,
+            return_report=True, repair_buildings=True)
+        self.assertEqual(result['updated'], 1)
+        connection = await self.session.get(ServiceConnection, connection_id)
+        building = await self.session.get(Object, connection.building_id)
+        self.assertNotEqual(building.id, original_id)
+        self.assertIsNone(building.geom)
+        self.assertIsNone(building.ckw_id)
+        self.assertEqual(building.insurance_numbers, ['001'])
+        self.assertEqual(connection.distribution_box_id, original_id)
+        self.assertEqual(asset.type, 'distribution_box')
+        again = await services.import_gps_objects(payload, self.session,
+            return_report=True, repair_buildings=True)
+        self.assertEqual(again['repairs'], [])
+        self.assertEqual(len(await self.objects()), 3)
+
+    async def test_gps_then_excel_keeps_same_address_separate(self):
+        payload = GPSImportData(points=[dict(name='Schlottermilch10', ckw_id='KAK10',
+            type='distribution_box', lat=47, lon=8)])
+        await services.import_gps_objects(payload, self.session)
+        entry = services.normalize_row(row('Schlottermilch 10'))[0]
+        entry['first_disconnect_point'] = 'Schlottermilch10'
+        await services.import_service_connections([entry], self.session)
+        await services.import_gps_objects(payload, self.session)
+        await services.import_service_connections([entry], self.session)
+        connection = (await self.connections())[0]
+        self.assertNotEqual(connection.building_id, connection.distribution_box_id)
+        self.assertEqual(len(await self.objects()), 3)
+        self.assertEqual(len(await self.connections()), 1)
+        building = await self.session.get(Object, connection.building_id)
+        self.assertIsNone(building.geom)
+
+    async def test_gps_repair_reuses_existing_building(self):
+        asset = Object(name='Haus1', type='building', ckw_id='KAK1', location='A')
+        building = Object(name='Haus1', type='building', location='A')
+        self.session.add_all([asset, building])
+        await self.session.commit()
+        payload = GPSImportData(points=[dict(name='Haus1', ckw_id='KAK1',
+            type='distribution_box', lat=47, lon=8)])
+        normal = await services.import_gps_objects(payload, self.session, return_report=True)
+        self.assertEqual(normal['skipped'], 1)
+        result = await services.import_gps_objects(payload, self.session,
+            return_report=True, repair_buildings=True)
+        self.assertEqual(result['repairs'][0]['building_id'], building.id)
+        self.assertEqual(len(await self.objects()), 3)
+
+    async def test_reference_requires_correct_grid_type(self):
+        self.session.add(Object(name='WrongBox', type='transformer', location='A'))
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        entry['first_disconnect_point'] = 'WrongBox'
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(await self.connections(), [])
 
     async def test_building_and_grid_asset_with_same_name_remain_separate(self):
         box = Object(name='Haus1', location='A', type='distribution_box')

@@ -158,7 +158,7 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
                     references[field + '_id'] = None
                 continue
             try:
-                found, alias_used = find_reference_object(objects, name, location) if name else (None, False)
+                found, alias_used = find_reference_object(objects, name, location, expected_type=field) if name else (None, False)
                 reason = 'object_not_found'
             except AmbiguousMatch:
                 found, reason = None, 'ambiguous_object_reference'
@@ -265,9 +265,43 @@ async def import_service_connections(raw_entries: list[dict], session: AsyncSess
     return report
 
 
-async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, *, return_report=False):
+async def restore_grid_object(session, objects, asset, target_type, report):
+    """Split historical building/asset collisions without changing grid or connection IDs."""
+    for field in ('transformer', 'distribution_box', 'disconnect_point'):
+        if field != target_type:
+            references = await session.scalar(select(ServiceConnection.id).where(
+                getattr(ServiceConnection, field + '_id') == asset.id).limit(1))
+            if references:
+                raise AmbiguousMatch(f'Existing {field} references conflict with GPS type for {asset.ckw_id}')
+    candidates = [o for o in objects if o.id != asset.id and o.type == ObjectType.building
+        and normalize_object_name(o.name) == normalize_object_name(asset.name)
+        and clean_text(o.location) == clean_text(asset.location)]
+    if len(candidates) > 1 or any(clean_text(o.ckw_id) for o in candidates):
+        raise AmbiguousMatch(f'Ambiguous replacement building for {asset.name}')
+    building = candidates[0] if candidates else Object(name=asset.name,
+        friendly_name=asset.friendly_name, location=asset.location,
+        description=asset.description, type=ObjectType.building)
+    if not candidates:
+        # Infrastructure coordinates are not evidence of the building's position.
+        session.add(building)
+        await session.flush()
+        objects.append(building)
+    building.insurance_numbers = list(dict.fromkeys(
+        (building.insurance_numbers or []) + (asset.insurance_numbers or [])))
+    connections = (await session.scalars(select(ServiceConnection).where(
+        ServiceConnection.building_id == asset.id))).all()
+    for connection in connections:
+        connection.building_id = building.id
+    asset.insurance_numbers = None
+    asset.type = target_type
+    report['repairs'].append(dict(asset_id=asset.id, ckw_id=asset.ckw_id,
+        building_id=building.id, target_type=target_type, moved_connections=len(connections)))
+
+
+async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, *, return_report=False, repair_buildings=False, dry_run=False):
     report = new_report()
-    async with import_transaction(session):
+    report.update(dry_run=dry_run, repairs=[])
+    async with import_transaction(session, dry_run=dry_run):
         objects = await load_objects(session)
         for point in import_data.points:
             obj_type = point.type
@@ -278,7 +312,17 @@ async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, 
                     report['warnings'].append(dict(object=point.name, field='type', reason='invalid_object_type', value=obj_type))
                     obj_type = None
             try:
-                existing = find_existing_object(objects, point.name, point.location, point.ckw_id)
+                # A CKW ID identifies infrastructure; names alone are type-scoped.
+                existing = find_existing_object(objects, point.name, point.location, point.ckw_id,
+                    expected_type=None if clean_text(point.ckw_id) and objects.assets[clean_text(point.ckw_id)] else obj_type)
+                if not clean_text(point.name):
+                    raise AmbiguousMatch('Empty object name')
+                repaired = False
+                if (repair_buildings and existing and existing.type == ObjectType.building
+                        and point.ckw_id and obj_type in (ObjectType.transformer,
+                            ObjectType.distribution_box, ObjectType.disconnect_point)):
+                    await restore_grid_object(session, objects, existing, obj_type, report)
+                    repaired = True
                 obj, status = await upsert_object(
                     session, objects, name=point.name, location=point.location, ckw_id=point.ckw_id,
                     type=obj_type or (existing.type if existing else ObjectType.distribution_box),
@@ -288,7 +332,7 @@ async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, 
                 report['warnings'].append(dict(object=point.name, field='object', reason='ambiguous_object', detail=str(exc)))
                 report['skipped'] += 1
                 continue
-            report[status] += 1
+            report['updated' if repaired else status] += 1
             report['imported'].append(obj)
     return report if return_report else report['imported']
 

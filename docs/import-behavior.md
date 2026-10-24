@@ -214,3 +214,13 @@ edits, missing references, optional reference updates/preservation/clearing,
 null/normalized arrays, legacy reimports, historical names/locations, conflicting
 and duplicate asset IDs, GPS preservation/renaming, multiple-source warnings,
 atomic rollback, and concurrent imports.
+
+## Infrastructure and building separation
+
+Connection references now require the exact column type (`transformer`,
+`distribution_box`, or `disconnect_point`) in both exact and alias matching.
+A same-address building is a distinct object. GPS supports `dry_run=true` and
+an explicit `repair_buildings=true` mode for historical CKW/building collisions.
+See the README's recommended import order and historical repair procedure.
+The repair retains asset and connection IDs and creates or reuses a separate
+building without copying infrastructure coordinates into a new building.
