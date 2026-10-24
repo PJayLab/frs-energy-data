@@ -1,5 +1,100 @@
 # FRS Energy Data API
 
+## Import runtime and progress
+
+Excel uses a read-only workbook reader. Connection imports load existing
+connections in batches of up to 1,000 buildings and batch-flush new objects and
+merge-mode connections instead of sending a query/flush for every row.
+The complete import still uses one transaction: other sessions see changes only
+after the final commit. A preview rolls back all changes.
+
+Progress is logged through `uvicorn.error` at INFO level: upload/workbook parsing,
+waiting for/acquiring the PostgreSQL import lock, object loading, every 500 rows
+or buildings, flushing, and committing. Run Uvicorn with INFO logging enabled.
+The lock serializes imports. A client-side cancellation does not guarantee that
+the server stopped processing; repeated requests can queue behind the first.
+Inspect the last progress message before retrying. These optimizations do not
+guarantee completion within a particular proxy or client timeout.
+
+## Excel first disconnect location
+
+The Excel `Erste Trennstelle` column accepts both distribution boxes and
+transformer stations. A station such as `SUR-Fruchthof` may be referenced by both
+the supply and first disconnect fields using the same object ID. The importer
+does not change its type or create a second artificial cabinet. Exact names,
+spelling aliases, and nearest-reference selection use the same compatible types.
+Buildings remain excluded; supply and unswitched-terminal roles retain their
+transformer and disconnect-point type requirements respectively.
+
+After deploying this change, reimport Excel using the default merge mode to retry
+previously skipped rows. No database reset or additional migration is required.
+Genuinely missing references and ambiguous geographic matches are still skipped.
+
+## GPS identities and nearest Excel references
+
+GPS imports treat different nonempty `ckw_id` values as separate assets, even
+when their names, types and municipalities are identical. Reimporting the same
+ID updates that asset's coordinates without creating another object. A unique
+same-name legacy object without a CKW ID may still be adopted. Without an ID,
+name matching remains ambiguous when multiple objects exist.
+
+For Excel/connection imports, multiple same-name candidates of the required
+network type are resolved by their distance to the existing building point.
+Exact normalized names take precedence over spelling aliases. Within the chosen
+candidate set, distance takes precedence over municipality. Distances are
+approximate great-circle metres using the haversine formula and EPSG:4326 points.
+The building and every candidate must have valid coordinates; a distance gap of
+one metre or less between the two closest candidates is rejected as ambiguous.
+Unique reference matches retain the existing matching behavior.
+
+The `nearest_reference_matched` diagnostic records the chosen internal ID,
+CKW ID, distance, and distances to all candidates. There is no automatic 1 km
+cutoff. A nearest match is a geometric heuristic, not proof of the electrical
+connection. Incorrect building coordinates can produce an incorrect selection.
+Import GPS assets (including building coordinates) first, then reimport Excel.
+Use the existing replacement preview/apply mode when stale connections prevent
+an ordinary merge; nearest matching does not by itself delete old connections.
+
+## Bounding-box coordinate audit
+
+Run [scripts/check_objects_outside_bbox.sql](scripts/check_objects_outside_bbox.sql)
+to list stored objects outside the configured Swiss LV95 (EPSG:2056) rectangle.
+Edit the two arrays `location_min` and `location_max` at the top of the script.
+Defaults are `(2647019, 1221480)` and `(2654711, 1230154)`. Stored WGS84 points
+are transformed to LV95 for the comparison; boundary points are inside.
+
+The query includes all object types, including objects without a CKW ID, but
+returns only points confirmed outside the box. Missing or invalid coordinates
+are excluded by default; the alternative documented filter includes their
+diagnostic statuses. Uncomment the CKW-ID filter to inspect only objects with a
+recorded `ckw_id`. Results include IDs, names, municipalities, types, CKW IDs,
+WGS84 coordinates, and LV95 eastings/northings for comparison with the bounds.
+This is a read-only audit of the local database, not a download from the CKW API.
+It does not change coordinates or connection assignments.
+
+## Connection coordinate audit
+
+Run [scripts/check_connection_distances.sql](scripts/check_connection_distances.sql)
+against the PostgreSQL/PostGIS database to find suspicious connection locations.
+This read-only query checks all three pairs: building/distribution box,
+building/transformer, and distribution box/transformer. Change `max_distance_m`
+(default 1,000 metres) in the first CTE to adjust the threshold. Exactly 1,000 m
+is within the limit. Distances use WGS84 geography, not degrees or pipe lengths.
+
+Results include object IDs, names, municipalities, coordinate statuses, valid
+coordinates, pairwise distances in metres, and review hints. Missing, empty,
+out-of-range, or otherwise invalid geometries are reported instead of silently
+excluded. An unassigned optional distribution box is not itself an error; the
+building/transformer pair is still checked. Sort order puts the largest known
+distance first and records with no calculable distance last.
+
+A distance violation flags a candidate for review, not proof that a particular
+coordinate is wrong: the connection assignment may be wrong, or the real service
+area may exceed the threshold. Review hints only identify the isolated point
+relative to the other two. Objects without service connections and optional
+disconnect points are outside this audit. Existing duplicate connections remain
+separate results, identifiable by their connection UUIDs. No records are changed.
+
 Backend service for importing and searching electricity grid object/location data.
 
 ## Features
@@ -125,7 +220,8 @@ if you need the old connection values listed in `removed_connections`.
    `distribution_box`, or `disconnect_point`.
 2. Import the Excel connection lists. Buildings are separate objects, even when
    their address equals a grid object's name (for example Schlottermilch 10).
-   Each network reference must match its column's type. Missing or ambiguous
+   Each network reference must match its role's compatible types (the first
+   disconnect location also accepts a transformer station). Missing or ambiguous
    references skip the row and appear in the import warnings.
 3. Let the external geocoding application fill coordinates only for objects with
    `type = 'building'` and missing geometry, using the building UUID to update

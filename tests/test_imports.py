@@ -9,7 +9,7 @@ import asyncio
 from io import BytesIO
 from unittest.mock import patch
 
-from sqlalchemy import JSON, Text, select, text
+from sqlalchemy import JSON, Text, select, text, event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.types import TypeDecorator
 
@@ -20,6 +20,7 @@ from app.api.import_router import import_excel, import_response
 from app.import_helpers import ObjectIndex, find_reference_object, upsert_object
 from fastapi import UploadFile, HTTPException
 from openpyxl import Workbook
+from geoalchemy2 import WKTElement
 
 
 class GeometryText(TypeDecorator):
@@ -144,15 +145,36 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
     async def connections(self):
         return list((await self.session.scalars(select(ServiceConnection))).all())
 
+    async def test_large_import_batches_connection_reads_and_is_idempotent(self):
+        entries = [services.normalize_row(row(f'Batch house {i}'))[0] for i in range(1001)]
+        reads = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith('SELECT') and 'FROM service_connections' in statement:
+                reads.append(statement)
+
+        event.listen(self.engine.sync_engine, 'before_cursor_execute', capture)
+        try:
+            first = await services.import_service_connections(entries, self.session)
+            self.assertEqual(first['created'], 1001)
+            self.assertEqual(len(reads), 2)
+            reads.clear()
+            second = await services.import_service_connections(entries, self.session)
+            self.assertEqual(second['unchanged'], 1001)
+            self.assertEqual(second['created'], 0)
+            self.assertEqual(len(reads), 2)
+        finally:
+            event.remove(self.engine.sync_engine, 'before_cursor_execute', capture)
+        self.assertEqual(len(await self.connections()), 1001)
+
     async def seed_wrong_municipality_connections(self):
         geu = Object(name='Bahnhofplatz6', location='Geuensee', type='building', insurance_numbers=['0103B', '0208'])
         sur = Object(name='Bahnhofplatz6', location='Sursee', type='building')
         geu_ts = Object(name='GEU-Allmend', type='transformer')
         sur_ts = Object(name='SUR-Fruchthof', type='transformer')
         box = Object(name='Hinterdorfstrasse16', type='distribution_box', location='Geuensee')
-        # Same-name grid roles are distinct under typed reference matching.
-        sur_box = Object(name='SUR-Fruchthof', type='distribution_box')
-        self.session.add_all([geu, sur, geu_ts, sur_ts, box, sur_box])
+        # A station itself can serve as the first disconnect location.
+        self.session.add_all([geu, sur, geu_ts, sur_ts, box])
         await self.session.flush()
         correct = ServiceConnection(building_id=geu.id, transformer_id=geu_ts.id, distribution_box_id=box.id,
             source_outgoing=['4'], disconnect_point_outgoing=['5'], connection_notes=[])
@@ -358,7 +380,7 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.objects()), 3)
 
     async def test_reference_requires_correct_grid_type(self):
-        self.session.add(Object(name='WrongBox', type='transformer', location='A'))
+        self.session.add(Object(name='WrongBox', type='disconnect_point', location='A'))
         await self.session.commit()
         entry = services.normalize_row(row())[0]
         entry['first_disconnect_point'] = 'WrongBox'
@@ -532,16 +554,57 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.connections(), [])
 
     async def test_reference_abbreviation_case_and_municipality(self):
-        box = Object(name='Eggstrasse11', location='A', type='distribution_box')
-        self.session.add_all([box, Object(name='Eggstrasse11', location='B', type='distribution_box')])
+        box = Object(name='Eggstrasse11', location='A', type='distribution_box', geom=WKTElement('POINT(8.001 47)', srid=4326))
+        self.session.add_all([box, Object(name='Eggstrasse11', location='B', type='distribution_box',
+            geom=WKTElement('POINT(8.5 47)', srid=4326)),
+            Object(name='Chäppelimatt5', location='A', type='building', geom=WKTElement('POINT(8 47)', srid=4326))])
         await self.session.commit()
         entry = services.normalize_row(row())[0]
         entry['first_disconnect_point'] = 'EGGSTR. 11'
         result = await services.import_service_connections([entry], self.session)
         self.assertEqual(result['created'], 1)
         self.assertEqual((await self.connections())[0].distribution_box_id, box.id)
-        self.assertEqual(result['warnings'][0]['reason'], 'reference_alias_matched')
+        self.assertIn('reference_alias_matched', [w['reason'] for w in result['warnings']])
         self.assertEqual(box.name, 'Eggstrasse11')
+
+    async def test_transformer_can_be_first_disconnect_exact_and_alias(self):
+        station = Object(name='SUR-Luzernstrasse44', type='transformer')
+        self.session.add(station)
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        entry['source_name'] = station.name
+        for name in (station.name, 'SUR-Luzernstr. 44'):
+            result = await services.import_service_connections([{**entry, 'first_disconnect_point': name}], self.session)
+            self.assertEqual(result['skipped'], 0)
+            connection = (await self.connections())[0]
+            self.assertEqual(connection.distribution_box_id, station.id)
+            self.assertEqual(connection.transformer_id, station.id)
+            self.assertEqual(station.type, 'transformer')
+        self.assertEqual(len(await self.connections()), 1)
+
+    async def test_first_disconnect_nearest_across_compatible_types(self):
+        building = Object(name='Haus1', type='building', location='A', geom=WKTElement('POINT(8 47)', srid=4326))
+        station = Object(name='Sternen', type='transformer', geom=WKTElement('POINT(8.001 47)', srid=4326))
+        box = Object(name='Sternen', type='distribution_box', geom=WKTElement('POINT(8.2 47)', srid=4326))
+        self.session.add_all([building, station, box])
+        await self.session.commit()
+        entry = services.normalize_row(row('Haus 1'))[0]
+        entry['first_disconnect_point'] = 'Sternen'
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['created'], 1)
+        self.assertEqual((await self.connections())[0].distribution_box_id, station.id)
+        self.assertEqual(result['warnings'][0]['reason'], 'nearest_reference_matched')
+
+    async def test_role_relaxation_excludes_buildings_and_preserves_other_roles(self):
+        self.session.add(Object(name='OnlyBuilding', type='building', location='A'))
+        self.session.add(Object(name='OnlyBox', type='distribution_box', location='A'))
+        await self.session.commit()
+        entry = services.normalize_row(row())[0]
+        for field, name in [('first_disconnect_point', 'OnlyBuilding'),
+                            ('source_name', 'OnlyBox'), ('unswitched_terminal', 'Transformer A')]:
+            result = await services.import_service_connections([{**entry, field: name}], self.session)
+            self.assertEqual(result['skipped'], 1)
+        self.assertEqual(await self.connections(), [])
 
     async def test_alias_collision_and_different_house_number_are_not_guessed(self):
         self.session.add_all([Object(name=n, type='distribution_box', location='A')
@@ -646,8 +709,58 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         self.session.add(Object(name='Haus1', type='building', ckw_id='one'))
         await self.session.commit()
         result = await services.import_gps_objects(GPSImportData(points=[dict(name='Haus 1', ckw_id='two', lat=47, lon=8)]), self.session, return_report=True)
+        self.assertEqual(result['created'], 1)
+        objects = await self.objects()
+        self.assertEqual(len(objects), 3)
+        self.assertEqual(next(o for o in objects if o.ckw_id == 'one').type, 'building')
+        self.assertIsNone(next(o for o in objects if o.ckw_id == 'one').geom)
+
+    async def test_three_sternen_import_reimport_and_nearest_connection(self):
+        payload = GPSImportData(points=[dict(name='Sternen', ckw_id=f'star-{i}',
+            type='distribution_box', location='A' if i != 1 else 'B', lat=47,
+            lon=longitude) for i, longitude in enumerate([8.5, 8.001, 8.2])])
+        first = await services.import_gps_objects(payload, self.session, return_report=True)
+        self.assertEqual(first['created'], 3)
+        ids = {o.ckw_id: o.id for o in await self.objects() if o.ckw_id}
+        second = await services.import_gps_objects(payload, self.session, return_report=True)
+        self.assertEqual(second['unchanged'], 3)
+        self.assertEqual({o.ckw_id: o.id for o in await self.objects() if o.ckw_id}, ids)
+        self.session.add(Object(name='Haus1', location='A', type='building', geom=WKTElement('POINT(8 47)', srid=4326)))
+        await self.session.commit()
+        entry = services.normalize_row(row('Haus 1'))[0]
+        entry['first_disconnect_point'] = 'Sternen'
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['created'], 1)
+        self.assertEqual((await self.connections())[0].distribution_box_id, ids['star-1'])
+        warning = next(w for w in result['warnings'] if w['reason'] == 'nearest_reference_matched')
+        self.assertTrue(70 < warning['distance_m'] < 80)
+        self.assertEqual(len(warning['candidates']), 3)
+        payload.points[1].lon = 8.002
+        result = await services.import_gps_objects(payload, self.session, return_report=True)
+        self.assertEqual(result['updated'], 1)
+        self.assertEqual({o.ckw_id: o.id for o in await self.objects() if o.ckw_id}, ids)
+
+    async def test_nearest_requires_all_coordinates_and_rejects_ties(self):
+        building = Object(name='Haus1', location='A', type='building')
+        first = Object(name='Sternen', type='distribution_box', ckw_id='s1', geom=WKTElement('POINT(8.001 47)', srid=4326))
+        second = Object(name='Sternen', type='distribution_box', ckw_id='s2', geom=WKTElement('POINT(8.2 47)', srid=4326))
+        self.session.add_all([building, first, second])
+        await self.session.commit()
+        entry = services.normalize_row(row('Haus 1'))[0]
+        entry['first_disconnect_point'] = 'Sternen'
+        result = await services.import_service_connections([entry], self.session)
         self.assertEqual(result['skipped'], 1)
-        self.assertEqual(len(await self.objects()), 2)
+        building.geom = WKTElement('POINT(8 47)', srid=4326)
+        second.geom = None
+        await self.session.commit()
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['skipped'], 1)
+        second.geom = WKTElement('POINT(8.001 47)', srid=4326)
+        await self.session.commit()
+        result = await services.import_service_connections([entry], self.session)
+        self.assertEqual(result['skipped'], 1)
+        self.assertIn('one metre', result['warnings'][0]['detail'])
+        self.assertEqual(await self.connections(), [])
 
     async def test_gps_preserves_missing_attributes_and_friendly_name(self):
         await services.import_service_connections(services.normalize_row(row()), self.session)

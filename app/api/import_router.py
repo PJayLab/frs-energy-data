@@ -1,6 +1,9 @@
 from io import BytesIO
 from collections import Counter
 from typing import Literal
+import logging
+
+logger = logging.getLogger('uvicorn.error')
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from openpyxl import load_workbook
@@ -36,11 +39,14 @@ async def import_excel(file: UploadFile = File(...), db: AsyncSession = Depends(
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
 
     content = await file.read()
-    workbook = load_workbook(filename=BytesIO(content), data_only=True)
+    logger.info('Excel import: upload read (%s bytes), opening workbook', len(content))
+    workbook = load_workbook(filename=BytesIO(content), data_only=True, read_only=True)
 
     if "Modified" not in workbook.sheetnames:
+        workbook.close()
         raise HTTPException(status_code=400, detail="Sheet 'Modified' not found")
     worksheet = workbook["Modified"]
+    logger.info('Excel import: workbook opened, reading Modified worksheet')
     if mode == 'replace_buildings':
         expected = ('Gemeinde', 'Objekt', 'Assek. Nr.', 'Bemerkungen/Verbindung',
                     'TK ohne Schaltmöglichkeit', 'Erste Trennstelle', 'Abgang Trennstelle',
@@ -55,6 +61,9 @@ async def import_excel(file: UploadFile = File(...), db: AsyncSession = Depends(
     for row_number, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), 2):
         normalized_rows.extend({**entry, "_excel_row": row_number} for entry in normalize_row(row))
     workbook.close()
+
+    logger.info('Excel import: %s normalized entries; starting %s (dry_run=%s)',
+                len(normalized_rows), mode, dry_run)
 
     try:
         import_result = await import_service_connections(normalized_rows, db,

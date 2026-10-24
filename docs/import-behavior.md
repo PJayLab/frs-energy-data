@@ -22,6 +22,22 @@ logs are not available to identify the exact import that produced the stored row
 
 ## Object identity
 
+GPS exception: when an incoming nonempty CKW ID is new, same-name objects with
+other nonempty CKW IDs are not identity candidates. The import creates a separate
+asset, or adopts a unique otherwise-matching legacy object without a CKW ID.
+The same ID continues to update the same object; duplicate stored IDs remain
+ambiguous. Connection/building upserts retain their stricter identity rules.
+
+Connection reference exception: when multiple exact normalized names (or, if
+none, multiple alias names) of the requested network type exist, use the nearest
+to the existing building coordinates across municipalities. Missing/invalid
+coordinates on the building or any candidate, and ties within one metre, block
+the match. `nearest_reference_matched` reports every candidate and the selection.
+The haversine distances are approximate metres, with no maximum-distance filter.
+This rule requires an existing, uniquely resolved building with valid coordinates;
+the Excel address itself is not geocoded. Single-candidate references retain the
+matching rules below. See the README for operational ordering and limitations.
+
 All three import paths use `normalize_object_name`: remove whitespace (including
 nonbreaking spaces), retaining case, accents and punctuation. `friendly_name`
 keeps readable spacing. A compact GPS name does not replace a formatted display
@@ -253,8 +269,14 @@ atomic rollback, and concurrent imports.
 
 ## Infrastructure and building separation
 
-Connection references now require the exact column type (`transformer`,
-`distribution_box`, or `disconnect_point`) in both exact and alias matching.
+Connection references use role-compatible types in both exact and alias matching.
+`source_name` requires `transformer`; `unswitched_terminal` requires
+`disconnect_point`. `first_disconnect_point` (Erste Trennstelle) accepts either
+`distribution_box` or `transformer`: a station itself can be the first disconnect
+location. Both compatible types participate together in nearest-reference
+selection. No object type is changed, and no duplicate cabinet is created for a
+station. Multiple candidates still require coordinates and an unambiguous nearest
+match. This applies to merge and replacement imports.
 A same-address building is a distinct object. GPS supports `dry_run=true` and
 an explicit `repair_buildings=true` mode for historical CKW/building collisions.
 See the README's recommended import order and historical repair procedure.

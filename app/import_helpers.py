@@ -3,9 +3,15 @@ from contextlib import asynccontextmanager
 from collections import defaultdict
 import re
 import unicodedata
+import math
+import logging
+from time import monotonic
+from shapely import wkt
 from geoalchemy2.shape import to_shape
 from sqlalchemy import select, text
-from app.models import Object, ServiceConnection
+from app.models import Object, ServiceConnection, gen_short_id
+
+logger = logging.getLogger('uvicorn.error')
 
 
 def clean_text(value):
@@ -88,16 +94,23 @@ async def import_transaction(session, *, dry_run=False):
     Serialize imports on PostgreSQL to prevent concurrent check/insert races.
     Callers must not pass sessions containing unrelated pending writes.
     """
+    started = monotonic()
     try:
         if session.get_bind().dialect.name == 'postgresql':
+            logger.info('Import: waiting for database import lock')
             await session.execute(text('SELECT pg_advisory_xact_lock(724183901)'))
+            logger.info('Import: database import lock acquired after %.2fs', monotonic() - started)
         yield
         if dry_run:
             await session.rollback()
+            logger.info('Import: preview rolled back after %.2fs', monotonic() - started)
         else:
+            logger.info('Import: committing transaction')
             await session.commit()
+            logger.info('Import: commit complete after %.2fs', monotonic() - started)
     except BaseException:
         await session.rollback()
+        logger.exception('Import: transaction rolled back after %.2fs', monotonic() - started)
         raise
 
 
@@ -108,7 +121,8 @@ def _unique(candidates, identity):
 
 
 def find_existing_object(objects, name, location=None, ckw_id=None, *, expected_type=None,
-                         allow_locationless=True, exclude_buildings=False):
+                         allow_locationless=True, exclude_buildings=False, distinct_assets=False,
+                         allowed_types=None):
     location, ckw_id = clean_text(location), clean_text(ckw_id)
     if ckw_id:
         assets = objects.assets[ckw_id] if isinstance(objects, ObjectIndex) else [o for o in objects if clean_text(o.ckw_id) == ckw_id]
@@ -122,8 +136,13 @@ def find_existing_object(objects, name, location=None, ckw_id=None, *, expected_
     candidates = objects.names[normalize_object_name(name)] if isinstance(objects, ObjectIndex) else [o for o in objects if normalize_object_name(o.name) == normalize_object_name(name)]
     if expected_type:
         candidates = [o for o in candidates if o.type == expected_type]
+    if allowed_types is not None:
+        candidates = [o for o in candidates if o.type in allowed_types]
     if exclude_buildings:
         candidates = [o for o in candidates if o.type != 'building']
+    if ckw_id and distinct_assets:
+        # Another nonempty CKW ID is a different physical asset, not a conflict.
+        candidates = [o for o in candidates if not clean_text(o.ckw_id)]
     if location:
         exact = [o for o in candidates if clean_text(o.location) == location]
         candidates = exact or ([o for o in candidates if not clean_text(o.location)] if allow_locationless else [])
@@ -133,22 +152,70 @@ def find_existing_object(objects, name, location=None, ckw_id=None, *, expected_
     return found
 
 
-def find_reference_object(objects, name, location=None, *, expected_type=None):
+def point_coordinates(obj):
+    if obj is None or obj.geom is None:
+        raise AmbiguousMatch('Missing coordinates for nearest-reference matching')
+    geom = obj.geom
+    if hasattr(geom, 'srid') and geom.srid != 4326:
+        raise AmbiguousMatch('Nearest-reference matching requires EPSG:4326')
+    try:
+        shape = wkt.loads(geom) if isinstance(geom, str) else to_shape(geom)
+        lon, lat = shape.x, shape.y
+        if shape.is_empty or not (math.isfinite(lon) and math.isfinite(lat)
+                                 and -180 <= lon <= 180 and -90 <= lat <= 90):
+            raise ValueError('Invalid point')
+        return lon, lat
+    except Exception as exc:
+        raise AmbiguousMatch('Invalid coordinates for nearest-reference matching') from exc
+
+
+def nearest_reference(candidates, building, diagnostics):
+    lon, lat = map(math.radians, point_coordinates(building))
+    ranked = []
+    for candidate in candidates:
+        other_lon, other_lat = map(math.radians, point_coordinates(candidate))
+        a = math.sin((other_lat - lat) / 2) ** 2 + math.cos(lat) * math.cos(other_lat) * math.sin((other_lon - lon) / 2) ** 2
+        distance = 6371008.8 * 2 * math.asin(math.sqrt(min(1.0, max(0.0, a))))
+        ranked.append((distance, candidate))
+    ranked.sort(key=lambda item: (item[0], item[1].id))
+    if ranked[1][0] - ranked[0][0] <= 1.0:
+        raise AmbiguousMatch('Nearest reference is ambiguous within one metre')
+    if diagnostics is not None:
+        diagnostics.append(dict(reason='nearest_reference_matched', matched_id=ranked[0][1].id,
+            matched_ckw_id=ranked[0][1].ckw_id, distance_m=round(ranked[0][0], 2),
+            distance_method='haversine', candidates=[dict(id=o.id, ckw_id=o.ckw_id,
+                distance_m=round(d, 2)) for d, o in ranked]))
+    return ranked[0][1]
+
+
+def find_reference_object(objects, name, location=None, *, expected_type=None,
+                          building=None, diagnostics=None, use_nearest=False):
+    # "Erste Trennstelle" is a connection role, not exclusively a cabinet.
+    allowed_types = (('distribution_box', 'transformer') if expected_type == 'distribution_box'
+                     else (expected_type,) if expected_type else None)
+    if use_nearest:
+        exact = objects.names[normalize_object_name(name)] if isinstance(objects, ObjectIndex) else [o for o in objects if normalize_object_name(o.name) == normalize_object_name(name)]
+        exact = [o for o in exact if o.type != 'building' and (allowed_types is None or o.type in allowed_types)]
+        aliases = objects.reference_names[reference_name_key(name)] if isinstance(objects, ObjectIndex) else [o for o in objects if reference_name_key(o.name) == reference_name_key(name)]
+        aliases = [o for o in aliases if o.type != 'building' and (allowed_types is None or o.type in allowed_types)]
+        candidates = exact or aliases
+        if len(candidates) > 1:
+            return nearest_reference(candidates, building, diagnostics), not bool(exact)
     # Preserve exact matching and its ambiguity checks before trying aliases.
-    found = find_existing_object(objects, name, location, exclude_buildings=True, expected_type=expected_type)
+    found = find_existing_object(objects, name, location, exclude_buildings=True, allowed_types=allowed_types)
     if found:
         return found, False
     key = reference_name_key(name)
     candidates = (objects.reference_names[key] if isinstance(objects, ObjectIndex)
                   else [o for o in objects if reference_name_key(o.name) == key])
-    candidates = [o for o in candidates if o.type != 'building' and (not expected_type or o.type == expected_type)]
+    candidates = [o for o in candidates if o.type != 'building' and (allowed_types is None or o.type in allowed_types)]
     if location:
         local = [o for o in candidates if reference_name_key(o.location) == reference_name_key(location)]
         unknown = [o for o in candidates if not clean_text(o.location)]
         if local or unknown:
             return _unique(local or unknown, f'reference={name}, location={location}'), True
     # An exact global name is preferred over a global alias (cross-border assets).
-    found = find_existing_object(objects, name, exclude_buildings=True, expected_type=expected_type)
+    found = find_existing_object(objects, name, exclude_buildings=True, allowed_types=allowed_types)
     if found:
         return found, False
     return _unique(candidates, f'reference={name}'), True
@@ -160,21 +227,24 @@ def _value_key(value):
     return value
 
 
-async def upsert_object(session, objects, *, name, location=None, ckw_id=None, **attributes):
+async def upsert_object(session, objects, *, name, location=None, ckw_id=None, defer_flush=False, **attributes):
     display = clean_text(name)
     if not display:
         raise AmbiguousMatch('Empty object name')
     allow_locationless = attributes.pop('allow_locationless', True)
+    distinct_assets = attributes.pop('distinct_assets', False)
     existing = find_existing_object(objects, display, location, ckw_id,
-        expected_type=attributes.get('type'), allow_locationless=allow_locationless)
+        expected_type=attributes.get('type'), allow_locationless=allow_locationless,
+        distinct_assets=distinct_assets)
     values = dict(name=normalize_object_name(display), location=clean_text(location), ckw_id=clean_text(ckw_id), **attributes)
     # Compact GPS names must not destroy a previously formatted display name.
     if not existing or not existing.friendly_name or normalize_object_name(existing.friendly_name) != values['name'] or display != values['name']:
         values['friendly_name'] = display
     if existing is None:
-        existing = Object(**{key: value for key, value in values.items() if value is not None})
+        existing = Object(id=gen_short_id(), **{key: value for key, value in values.items() if value is not None})
         session.add(existing)
-        await session.flush()
+        if not defer_flush:
+            await session.flush()
         objects.append(existing)
         return existing, 'created'
     changed = False
@@ -221,12 +291,13 @@ def connection_content_key(connection):
     return build_connection_signature(connection), normalize_array_for_comparison(connection.connection_notes)
 
 
-async def upsert_service_connection(session, candidates, values, incoming_signatures, *, warnings=None):
+async def upsert_service_connection(session, candidates, values, incoming_signatures, *, warnings=None, defer_flush=False):
     existing = find_existing_service_connection(candidates, values, incoming_signatures)
     if existing is None:
-        existing = ServiceConnection(**values)
+        existing = ServiceConnection(id=gen_short_id(), **values)
         session.add(existing)
-        await session.flush()
+        if not defer_flush:
+            await session.flush()
         candidates.append(existing)
         return existing, 'created'
     # Preserve every ID (including issue-report references). Only equivalent

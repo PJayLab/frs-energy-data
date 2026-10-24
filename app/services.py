@@ -1,4 +1,7 @@
 from collections import defaultdict
+import logging
+
+logger = logging.getLogger('uvicorn.error')
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -113,6 +116,8 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
         name_locations[normalize_object_name(entry.get('object') or entry.get('objekt'))].add(
             clean_text(entry.get('municipality') or entry.get('gemeinde')))
     for row_number, entry in enumerate(raw_entries, 1):
+        if row_number == 1 or row_number % 500 == 0:
+            logger.info('Import: preparing connection row %s/%s', row_number, len(raw_entries))
         display = clean_text(entry.get('object') or entry.get('objekt'))
         location = clean_text(entry.get('municipality') or entry.get('gemeinde'))
         scope = (location, normalize_object_name(display))
@@ -140,6 +145,15 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
                 continue
         references = {}
         failed = False
+        try:
+            reference_building = find_existing_object(objects, display, location, entry.get('ckw_id'),
+                expected_type=ObjectType.building,
+                allow_locationless=not replace_existing and len(name_locations[scope[1]]) == 1)
+        except AmbiguousMatch as exc:
+            report['warnings'].append(dict(**context, field='building', reason='ambiguous_object', detail=str(exc)))
+            blocked.add(scope)
+            report['skipped'] += 1
+            continue
         for field, name in (
             ('disconnect_point', entry_value(entry, 'unswitched_terminal', 'tk_ohne_schalt')),
             ('distribution_box', entry_value(entry, 'first_disconnect_point', 'erste_trennstelle')),
@@ -158,10 +172,17 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
                     references[field + '_id'] = None
                 continue
             try:
-                found, alias_used = find_reference_object(objects, name, location, expected_type=field) if name else (None, False)
+                diagnostics = []
+                found, alias_used = find_reference_object(objects, name, location, expected_type=field,
+                    building=reference_building, diagnostics=diagnostics, use_nearest=True) if name else (None, False)
+                report['warnings'].extend({**w, **context, 'field': field, 'source_name': name} for w in diagnostics)
                 reason = 'object_not_found'
-            except AmbiguousMatch:
+            except AmbiguousMatch as exc:
                 found, reason = None, 'ambiguous_object_reference'
+                report['warnings'].append(dict(**context, field=field, reason=reason,
+                    missing_reference=name, detail=str(exc)))
+                failed = True
+                continue
             if found:
                 references[field + '_id'] = found.id
                 if alias_used:
@@ -178,6 +199,7 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
         try:
             building, status = await upsert_object(session, objects, name=display, location=location,
                 ckw_id=entry.get('ckw_id'), type=ObjectType.building,
+                defer_flush=True,
                 allow_locationless=not replace_existing and len(name_locations[scope[1]]) == 1)
         except AmbiguousMatch as exc:
             blocked.add(scope)
@@ -207,8 +229,20 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
                 values[field] = split_compact(value)
         prepared[building.id].append((values, context))
 
-    for building_id, rows in prepared.items():
-        candidates = list((await session.scalars(select(ServiceConnection).where(ServiceConnection.building_id == building_id))).all())
+    logger.info('Import: flushing prepared objects for %s buildings', len(prepared))
+    await session.flush()
+    existing_connections = defaultdict(list)
+    building_ids = list(prepared)
+    logger.info('Import: loading existing connections in batches')
+    for offset in range(0, len(building_ids), 1000):
+        batch = building_ids[offset:offset + 1000]
+        for connection in (await session.scalars(select(ServiceConnection).where(
+                ServiceConnection.building_id.in_(batch)))).all():
+            existing_connections[connection.building_id].append(connection)
+    for building_number, (building_id, rows) in enumerate(prepared.items(), 1):
+        if building_number == 1 or building_number % 500 == 0:
+            logger.info('Import: reconciling building %s/%s', building_number, len(prepared))
+        candidates = existing_connections[building_id]
         if replace_existing:
             building = buildings[building_id]
             if (clean_text(building.location), normalize_object_name(building.name)) in blocked:
@@ -235,7 +269,7 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
             try:
                 connection_warnings = []
                 connection, status = await upsert_service_connection(
-                    session, candidates, values, signatures, warnings=connection_warnings)
+                    session, candidates, values, signatures, warnings=connection_warnings, defer_flush=True)
                 report['warnings'].extend({**w, **context} for w in connection_warnings)
             except AmbiguousMatch as exc:
                 report['warnings'].append(dict(**context, field='connection', reason='ambiguous_connection', detail=str(exc)))
@@ -243,6 +277,9 @@ async def _import_connections(raw_entries, session, objects, report, *, replace_
                 continue
             report[status] += 1
             report['imported'].append(connection)
+    logger.info('Import: flushing connections (created=%s updated=%s unchanged=%s skipped=%s)',
+        report['created'], report['updated'], report['unchanged'], report['skipped'])
+    await session.flush()
 
 
 async def import_service_connections(raw_entries: list[dict], session: AsyncSession, *,
@@ -260,7 +297,10 @@ async def import_service_connections(raw_entries: list[dict], session: AsyncSess
     report.update(dry_run=dry_run, mode='replace_buildings' if replace_existing else 'merge',
                   deleted=0, consolidated=0, removed_connections=[])
     async with import_transaction(session, dry_run=dry_run):
-        await _import_connections(raw_entries, session, await load_objects(session), report,
+        logger.info('Import: loading object index')
+        objects = await load_objects(session)
+        logger.info('Import: loaded %s objects', len(objects))
+        await _import_connections(raw_entries, session, objects, report,
                                   replace_existing=replace_existing)
     return report
 
@@ -314,6 +354,7 @@ async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, 
             try:
                 # A CKW ID identifies infrastructure; names alone are type-scoped.
                 existing = find_existing_object(objects, point.name, point.location, point.ckw_id,
+                    distinct_assets=True,
                     expected_type=None if clean_text(point.ckw_id) and objects.assets[clean_text(point.ckw_id)] else obj_type)
                 if not clean_text(point.name):
                     raise AmbiguousMatch('Empty object name')
@@ -325,6 +366,7 @@ async def import_gps_objects(import_data: GPSImportData, session: AsyncSession, 
                     repaired = True
                 obj, status = await upsert_object(
                     session, objects, name=point.name, location=point.location, ckw_id=point.ckw_id,
+                    distinct_assets=True,
                     type=obj_type or (existing.type if existing else ObjectType.distribution_box),
                     geom=WKTElement(f'POINT({point.lon} {point.lat})', srid=4326),
                 )
